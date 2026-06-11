@@ -3,10 +3,10 @@ import mysql.connector
 
 # Database connection config. Reads from environment variables with fallback defaults for local development
 DB_CONFIG = {
-    "host": os.getenv("DB_HOST", "localhost"),
-    "user": os.getenv("DB_USER", "root"),
-    "password": os.getenv("DB_PASSWORD", "@Wango005"),
-    "database": os.getenv("DB_NAME", "ai_audit"),
+    "host": os.getenv("db_host"),
+    "user": os.getenv("db_user"),
+    "password": os.getenv("db_password"),
+    "database": os.getenv("db_name"),
 }
 
 # Open and return a new MySQL connection using the config above

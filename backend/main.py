@@ -43,7 +43,7 @@ async def startup_event():
     init_db()
 
 # Security config for JWT token generation and password hashing
-SECRET_KEY = "auditiq-secret-key-change-in-production"
+SECRET_KEY = os.getenv("SECRET_KEY")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_HOURS = 8
 pwd_context = CryptContext(schemes=["sha256_crypt"], deprecated="auto")

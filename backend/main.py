@@ -593,14 +593,14 @@ def password_reset_confirm(req: PasswordResetConfirm, db=Depends(get_db)):
     db.commit()
     return {"message": "Password reset successful"}
 
-# COLUMN MAPPINGS 
+# User management column mappings 
 
 # Get all column mappings across all clients
-@audit_router.get("/column-mappings")
-def get_all_mappings(db=Depends(get_db)):
-    cursor = db.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM column_mappings")
-    return cursor.fetchall()
+# @audit_router.get("/column-mappings")
+# def get_all_mappings(db=Depends(get_db)):
+#     cursor = db.cursor(dictionary=True)
+#     cursor.execute("SELECT * FROM column_mappings")
+#     return cursor.fetchall()
 
 # Get all column mappings for a specific client
 @audit_router.get("/column-mappings/{client_id}")
@@ -608,18 +608,6 @@ def get_client_mappings(client_id: str, db=Depends(get_db)):
     cursor = db.cursor(dictionary=True)
     cursor.execute("SELECT * FROM column_mappings WHERE client_id = %s", (client_id,))
     return cursor.fetchall()
-
-# Manually create a new column mapping for a client
-@audit_router.post("/column-mappings")
-def create_mapping(m: ColumnMapping, db=Depends(get_db)):
-    cursor = db.cursor()
-    cursor.execute(
-        """INSERT INTO column_mappings (client_id, file_type, original_column, mapped_to, confirmed_by)
-           VALUES (%s, %s, %s, %s, %s)""",
-        (m.client_id, m.file_type, m.original_column, m.mapped_to, m.confirmed_by)
-    )
-    db.commit()
-    return {"id": cursor.lastrowid, "message": "Column mapping created"}
 
 # Update an existing column mapping by mapping_id
 @audit_router.put("/column-mappings/{mapping_id}")
@@ -882,29 +870,29 @@ def mark_all_read(user_id: int, db=Depends(get_db)):
     db.commit()
     return {"message": "All notifications marked as read"}
 
-# CLIENT FILE UPLOAD 
-# Upload a file for a specific client. Saves the file to disk and records it in the uploads table for audit trail.
-@audit_router.post("/clients/{client_id}/upload")
-def upload_client_file(client_id: int, file: UploadFile = File(...), db=Depends(get_db)):
-    allowed_types = ["xlsx", "xls", "csv", "pdf", "tiff", "tif", "jpg", "jpeg", "png", "xml", "json", "txt"]
-    file_ext = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else ""
-    if file_ext not in allowed_types:
-        raise HTTPException(status_code=400, detail="File format not allowed. Accepted: Excel (.xlsx, .xls), CSV (.csv), PDF (.pdf), Scanned (.jpg, .png, .tiff), ERP (.xml, .json, .txt)")
-    file_path = f"{UPLOAD_DIR}/{client_id}_{file.filename}"
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-    cursor = db.cursor()
-    cursor.execute("INSERT INTO uploads (client_id, file_name, file_type, file_path) VALUES (%s, %s, %s, %s)",
-                   (client_id, file.filename, file_ext.upper(), file_path))
-    db.commit()
-    return {"file_id": cursor.lastrowid, "filename": file.filename, "type": file_ext.upper(), "message": "File uploaded successfully"}
+# # CLIENT FILE UPLOAD 
+# # Upload a file for a specific client. Saves the file to disk and records it in the uploads table for audit trail.
+# @audit_router.post("/clients/{client_id}/upload")
+# def upload_client_file(client_id: int, file: UploadFile = File(...), db=Depends(get_db)):
+#     allowed_types = ["xlsx", "xls", "csv", "pdf", "tiff", "tif", "jpg", "jpeg", "png", "xml", "json", "txt"]
+#     file_ext = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else ""
+#     if file_ext not in allowed_types:
+#         raise HTTPException(status_code=400, detail="File format not allowed. Accepted: Excel (.xlsx, .xls), CSV (.csv), PDF (.pdf), Scanned (.jpg, .png, .tiff), ERP (.xml, .json, .txt)")
+#     file_path = f"{UPLOAD_DIR}/{client_id}_{file.filename}"
+#     with open(file_path, "wb") as buffer:
+#         shutil.copyfileobj(file.file, buffer)
+#     cursor = db.cursor()
+#     cursor.execute("INSERT INTO uploads (client_id, file_name, file_type, file_path) VALUES (%s, %s, %s, %s)",
+#                    (client_id, file.filename, file_ext.upper(), file_path))
+#     db.commit()
+#     return {"file_id": cursor.lastrowid, "filename": file.filename, "type": file_ext.upper(), "message": "File uploaded successfully"}
 
 # Get all files uploaded for a specific client
-@audit_router.get("/clients/{client_id}/files")
-def get_client_files(client_id: int, db=Depends(get_db)):
-    cursor = db.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM uploads WHERE client_id = %s", (client_id,))
-    return cursor.fetchall()
+# @audit_router.get("/clients/{client_id}/files")
+# def get_client_files(client_id: str, db=Depends(get_db)):
+#     cursor = db.cursor(dictionary=True)
+#     cursor.execute("SELECT * FROM uploads WHERE client_id = %s", (client_id,))
+#     return cursor.fetchall()
 
 # Get all uploaded files across all clients joined with company name. For admin use only — should be protected in production
 @audit_router.get("/files")

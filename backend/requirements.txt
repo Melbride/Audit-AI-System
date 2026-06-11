@@ -5,7 +5,7 @@ openpyxl==3.1.2
 python-multipart==0.0.9
 aiofiles==23.2.1
 mysql-connector-python==9.0.0
-mysql-connector-python
-python-multipart
-pydantic
-
+passlib[bcrypt]
+python-jose[cryptography]
+pdfplumber
+python-docx

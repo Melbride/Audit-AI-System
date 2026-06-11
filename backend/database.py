@@ -7,6 +7,7 @@ DB_CONFIG = {
     "user": os.getenv("db_user"),
     "password": os.getenv("db_password"),
     "database": os.getenv("db_name"),
+    "use_pure": True,
 }
 
 # Open and return a new MySQL connection using the config above
@@ -142,7 +143,8 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # Uploads table. Tracks every file uploaded per client for audit trail. File_id is a UUID generated at upload time and must be unique
+    # Uploads table. Tracks every file uploaded per client for audit trail. File_id is a UUID generated at upload time and must be unique.
+    # `rows` is wrapped in backticks because it is a reserved word in MySQL
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS uploads (
             id          INT AUTO_INCREMENT PRIMARY KEY,
@@ -152,7 +154,7 @@ def init_db():
             file_name   VARCHAR(255),
             file_type   VARCHAR(100) NOT NULL,
             file_path   VARCHAR(500),
-            rows        INT,
+            `rows`      INT,
             status      VARCHAR(50) DEFAULT 'uploaded',
             upload_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             upload_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -165,7 +167,7 @@ def init_db():
     cursor.execute("SELECT COUNT(*) AS count FROM information_schema.columns WHERE table_schema = %s AND table_name = 'uploads' AND column_name = 'file_path'", (DB_CONFIG["database"],))
     if cursor.fetchone()["count"] == 0:
         cursor.execute("ALTER TABLE uploads ADD COLUMN file_path VARCHAR(500) NULL")
-    # The upload_date column was added later to track the original upload timestamp separately from upload_time which gets updated on status changes. 
+    # The upload_date column was added later to track the original upload timestamp separately from upload_time which gets updated on status changes.
     # This check ensures it gets added to existing tables without affecting new ones.
     cursor.execute("SELECT COUNT(*) AS count FROM information_schema.columns WHERE table_schema = %s AND table_name = 'uploads' AND column_name = 'upload_date'", (DB_CONFIG["database"],))
     if cursor.fetchone()["count"] == 0:
@@ -231,8 +233,9 @@ def get_mapping(client_id: str, file_type: str = "general") -> dict:
 def save_upload(file_id: str, client_id: str, filename: str, file_type: str, rows: int):
     conn = get_connection()
     cursor = conn.cursor()
+    # `rows` is wrapped in backticks because it is a reserved word in MySQL
     cursor.execute(
-        "INSERT INTO uploads (file_id, client_id, filename, file_type, rows) VALUES (%s, %s, %s, %s, %s) ON DUPLICATE KEY UPDATE file_id = file_id",
+        "INSERT INTO uploads (file_id, client_id, filename, file_type, `rows`) VALUES (%s, %s, %s, %s, %s) ON DUPLICATE KEY UPDATE file_id = file_id",
         (file_id, client_id, filename, file_type, rows)
     )
     conn.commit()
@@ -243,12 +246,12 @@ def get_uploads(client_id: str) -> list:
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
     cursor.execute("""
-        SELECT * FROM uploads
-        WHERE client_id = %s
-        ORDER BY upload_time DESC
+        SELECT u.*, c.company_name
+        FROM uploads u
+        LEFT JOIN clients c ON u.client_id = c.client_id
+        WHERE u.client_id = %s
+        ORDER BY u.upload_time DESC
     """, (client_id,))
     rows = cursor.fetchall()
     conn.close()
     return [dict(row) for row in rows]
-
-

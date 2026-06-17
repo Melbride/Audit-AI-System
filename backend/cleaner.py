@@ -2,6 +2,23 @@ import pandas as pd
 import re
 from datetime import datetime
 
+# Known boolean/status value groups that should be consistent — flag if mixed
+BOOLEAN_VALUE_GROUPS = [
+    {'yes', 'no'},
+    {'y', 'n'},
+    {'true', 'false'},
+    {'paid', 'unpaid'},
+    {'active', 'inactive'},
+]
+
+def normalize_amount_str(s: str) -> str:
+    # Remove spaces used as thousand separators e.g. "7 200" -> "7200"
+    s = re.sub(r'(\d)\s+(\d)', r'\1\2', s)
+    # Remove all non-numeric chars except dot and minus
+    s = re.sub(r'[^\d.-]', '', s)
+    # Collapse multiple dots
+    s = re.sub(r'\.(?=.*\.)', '', s)
+    return s
 
 # Main function to clean the dataframe based on the confirmed mapping
 def clean_dataframe(df: pd.DataFrame, mapping: dict) -> tuple:
@@ -26,6 +43,8 @@ def clean_dataframe(df: pd.DataFrame, mapping: dict) -> tuple:
     df = standardize_casing(df, mapping, issues)
     # Handle null values
     df = handle_nulls(df, mapping, issues)
+    # Check text columns for inconsistent boolean/status values
+    check_value_consistency(df, mapping, issues)
     # Handle duplicates
     df = handle_duplicates(df, mapping, issues)
     # Build the validation report
@@ -37,12 +56,15 @@ def rename_columns(df: pd.DataFrame, mapping: dict) -> pd.DataFrame:
     """
     Rename original columns to their mapped standard names.Extracts mapped_to from the new mapping structure.
     Must be called before any cleaning step so cleaning functions. Can find columns by their standard names.
+    Columns mapped to "unknown" are skipped and kept under their original name.
+    This prevents multiple unknown columns from colliding into one duplicate "unknown" column.
     """
     # Build a rename dictionary from the new mapping structure.{original_col: mapped_to}
+    # Skip "unknown" mappings so each unmapped column keeps its own unique original name
     rename_dict = {
-        original_col: info["mapped_to"]
+        original_col: info["mapped_to"].strip()
         for original_col, info in mapping.items()
-        if isinstance(info, dict) and "mapped_to" in info
+        if isinstance(info, dict) and "mapped_to" in info and info["mapped_to"].strip() != "unknown"
     }
     df = df.rename(columns=rename_dict)
     return df
@@ -52,12 +74,15 @@ def clean_dates(df: pd.DataFrame, mapping: dict, issues: list) -> pd.DataFrame:
     """
     Find all columns with field_type 'date' using the confirmed mapping.Standardizes all date values to YYYY-MM-DD format.
     Uses DD/MM/YYYY as the standard input format.Flags any dates that cannot be parsed for auditor review.
+    Skips columns mapped to "unknown" since those were not renamed and have no standard meaning yet.
     """
     # Find all columns whose field_type is date using the mapping. Look at mapped_to names because columns were already renamed.
+    # Skip "unknown" mapped_to since those columns were left under their original name and have no confirmed field_type
     date_columns = [
         info["mapped_to"]
         for info in mapping.values()
         if isinstance(info, dict) and info.get("field_type") == "date"
+        and info.get("mapped_to") != "unknown"
         and info.get("mapped_to") in df.columns
     ]
     for col in date_columns:
@@ -101,12 +126,15 @@ def clean_amounts(df: pd.DataFrame, mapping: dict, issues: list) -> pd.DataFrame
     Find all columns with field_type 'numeric' using the confirmed mapping.Standardizes values to float numbers.
     Removes commas, currency symbols and whitespace.Converts accounting negatives e.g.(1,500) to -1500.0.
     Flags values that cannot be converted to a number.
+    Skips columns mapped to "unknown" since those were not renamed and have no standard meaning yet.
     """
     # Find all columns whose field_type is numeric using the mapping. Look at mapped_to names because columns were already renamed.
+    # Skip "unknown" mapped_to since those columns were left under their original name and have no confirmed field_type
     amount_columns = [
         info["mapped_to"]
         for info in mapping.values()
         if isinstance(info, dict) and info.get("field_type") == "numeric"
+        and info.get("mapped_to") != "unknown"
         and info.get("mapped_to") in df.columns
     ]
     for col in amount_columns:
@@ -122,9 +150,8 @@ def clean_amounts(df: pd.DataFrame, mapping: dict, issues: list) -> pd.DataFrame
             cleaned_str = str(value).strip()
             # Check for accounting negative notation e.g. (1,500)
             is_negative = cleaned_str.startswith("(") and cleaned_str.endswith(")")
-            # Remove currency symbols, letters, commas and whitespace. Keeps only digits, dots and minus signs
             cleaned_str = cleaned_str.strip("()")
-            cleaned_str = re.sub(r"[^\d.-]", "", cleaned_str)
+            cleaned_str = normalize_amount_str(cleaned_str)
 
             # Try converting to float
             try:
@@ -152,12 +179,15 @@ def standardize_casing(df: pd.DataFrame, mapping: dict, issues: list) -> pd.Data
     Find all columns with field_type 'title' using confirmed mapping.
     Standardizes all text values to Title Case.
     Skips empty values and numeric-looking values.
+    Skips columns mapped to "unknown" since those were not renamed and have no standard meaning yet.
     """
     # Find all columns whose field_type is text using the mapping.
+    # Skip "unknown" mapped_to since those columns were left under their original name and have no confirmed field_type
     text_columns = [
         info["mapped_to"]
         for info in mapping.values()
         if isinstance(info, dict) and info.get("field_type") == "text"
+        and info.get("mapped_to") != "unknown"
         and info.get("mapped_to") in df.columns
     ]
     # Loop through text columns and standardize to title case, skipping empty and numeric values
@@ -173,27 +203,93 @@ def standardize_casing(df: pd.DataFrame, mapping: dict, issues: list) -> pd.Data
             df.at[idx, col] = str(value).strip().title()
     return df
 
+# Function to check text columns for inconsistent boolean/status values
+def check_value_consistency(df: pd.DataFrame, mapping: dict, issues: list) -> None:
+    text_columns = [
+        info["mapped_to"].strip()
+        for info in mapping.values()
+        if isinstance(info, dict) and info.get("field_type") == "text"
+        and info.get("mapped_to", "").strip() not in ("", "unknown")
+        and info.get("mapped_to", "").strip() in df.columns
+    ]
+    for col in text_columns:
+        unique_vals = set(
+            str(v).strip().lower()
+            for v in df[col].dropna()
+            if str(v).strip() != ""
+        )
+        for group in BOOLEAN_VALUE_GROUPS:
+            found = unique_vals & group
+            if len(found) > 1:
+                issues.append({
+                    "row": "N/A",
+                    "column": col,
+                    "row_index": "N/A",
+                    "original_value": str(found),
+                    "issue": f"Inconsistent values in '{col}': found {found} — please standardize to one format e.g. Yes/No",
+                    "severity": "medium"
+                })
+                break
+
+# Function to check if any date column appears out of order relative to another date column in the same row
+def check_date_order(df: pd.DataFrame, mapping: dict, issues: list) -> None:
+    date_cols = [
+        info["mapped_to"].strip()
+        for info in mapping.values()
+        if isinstance(info, dict) and info.get("field_type") == "date"
+        and info.get("mapped_to", "").strip() not in ("", "unknown")
+        and info.get("mapped_to", "").strip() in df.columns
+    ]
+    if len(date_cols) < 2:
+        return
+    for idx in df.index:
+        parsed = []
+        for col in date_cols:
+            try:
+                parsed.append((col, pd.to_datetime(str(df.at[idx, col]), dayfirst=True)))
+            except Exception:
+                pass
+        # Flag any pair where the second date is before the first by more than 1 day to avoid same-day false positives
+        for i in range(len(parsed) - 1):
+            col_a, date_a = parsed[i]
+            col_b, date_b = parsed[i + 1]
+            if (date_a - date_b).days > 1:
+                issues.append({
+                    "row": int(idx) + 2,
+                    "column": col_b,
+                    "row_index": idx,
+                    "original_value": str(df.at[idx, col_b]),
+                    "issue": f"'{col_b}' ({df.at[idx, col_b]}) is earlier than '{col_a}' ({df.at[idx, col_a]}) — please verify the date order",
+                    "severity": "medium"
+                })
+
 # Function to handle null values
 def handle_nulls(df: pd.DataFrame, mapping: dict, issues: list) -> pd.DataFrame:
     """
     Flags two types of issues:
     1. Missing values in all confirmed mapped columns
-    2. Columns that could not be mapped — flagged once per column not per row
+    2. Columns that could not be mapped — flagged once per column not per row, using the column's original name
     Does not drop or fill any values — auditor decides.
     """
-    # Flag unknown columns once — not per row
+    # Flag unknown columns once — not per row. Use original_col since unknown columns were never renamed
     for original_col, info in mapping.items():
         if isinstance(info, dict) and info.get("mapped_to") == "unknown":
+            reviewed_unknown = bool(info.get("reviewed_unknown"))
             issues.append({
                 "row": "N/A",
                 "column": original_col,
                 "row_index": "N/A",
                 "original_value": "N/A",
-                "issue": f"Column '{original_col}' could not be mapped to a financial field, please confirm its meaning",
-                "severity": "medium"
+                "issue": (
+                    f"Column '{original_col}' was reviewed by the auditor and left as unknown"
+                    if reviewed_unknown
+                    else f"Column '{original_col}' could not be mapped to a financial field, please confirm its meaning"
+                ),
+                "severity": "info" if reviewed_unknown else "medium"
             })
 
     # Flag missing values in all confirmed columns
+    # Skip unknown mapped_to since those are already flagged above with a single column-level issue
     confirmed_columns = [
         info["mapped_to"]
         for info in mapping.values()
@@ -242,14 +338,17 @@ def handle_duplicates(df: pd.DataFrame, mapping: dict, issues: list) -> pd.DataF
         df["_is_duplicate"] = df.duplicated(keep="first")
 
         # Find all date and numeric columns using the mapping
+        # Skip "unknown" mapped_to since those columns were left under their original name
         date_cols = [
             info["mapped_to"] for info in mapping.values()
             if isinstance(info, dict) and info.get("field_type") == "date"
+            and info.get("mapped_to") != "unknown"
             and info.get("mapped_to") in df.columns
         ]
         amount_cols = [
             info["mapped_to"] for info in mapping.values()
             if isinstance(info, dict) and info.get("field_type") == "numeric"
+            and info.get("mapped_to") != "unknown"
             and info.get("mapped_to") in df.columns
         ]
         # Combine date and numeric columns for suspicious duplicate check
@@ -280,12 +379,17 @@ def build_validation_report(df: pd.DataFrame, original_df: pd.DataFrame, issues:
     Shows total rows, clean rows, flagged rows and a breakdown of issues by type and severity.
     """
     total_rows = len(original_df)
-    flagged_rows = len(set(issue["row_index"] for issue in issues if "row_index" in issue))
+    flagged_rows = len(set(
+        issue["row_index"]
+        for issue in issues
+        if "row_index" in issue and issue.get("severity") != "info" and issue["row_index"] != "N/A"
+    ))
     clean_rows = total_rows - flagged_rows
 
     # Count issues by severity
     high_issues = [i for i in issues if i.get("severity") == "high"]
     medium_issues = [i for i in issues if i.get("severity") == "medium"]
+    info_issues = [i for i in issues if i.get("severity") == "info"]
     # Build report dictionary
     return {
         "total_rows": total_rows,
@@ -294,10 +398,8 @@ def build_validation_report(df: pd.DataFrame, original_df: pd.DataFrame, issues:
         "total_issues": len(issues),
         "high_issues": len(high_issues),
         "medium_issues": len(medium_issues),
+        "info_issues": len(info_issues),
         "issues": issues
     }
-
-            
-
 
 

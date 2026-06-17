@@ -38,12 +38,20 @@ def init_db():
             original_column VARCHAR(255) NOT NULL,
             mapped_to       VARCHAR(255) NOT NULL,
             field_type      VARCHAR(100) NOT NULL DEFAULT 'unknown',
+            reviewed_unknown TINYINT(1) NOT NULL DEFAULT 0,
+            required        TINYINT(1) NOT NULL DEFAULT 1,
             confirmed_by    VARCHAR(255),
             created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
             UNIQUE KEY uq_column_mapping (client_id, file_type, original_column)
         )
     """)
+    cursor.execute("SELECT COUNT(*) AS count FROM information_schema.columns WHERE table_schema = %s AND table_name = 'column_mappings' AND column_name = 'reviewed_unknown'", (DB_CONFIG["database"],))
+    if cursor.fetchone()["count"] == 0:
+        cursor.execute("ALTER TABLE column_mappings ADD COLUMN reviewed_unknown TINYINT(1) NOT NULL DEFAULT 0")
+    cursor.execute("SELECT COUNT(*) AS count FROM information_schema.columns WHERE table_schema = %s AND table_name = 'column_mappings' AND column_name = 'required'", (DB_CONFIG["database"],))
+    if cursor.fetchone()["count"] == 0:
+        cursor.execute("ALTER TABLE column_mappings ADD COLUMN required TINYINT(1) NOT NULL DEFAULT 1")
     # Clients table. Stores company information for each audit client
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS clients (
@@ -182,25 +190,36 @@ def init_db():
 def save_mapping(client_id: str, file_type: str, mapping: dict, confirmed_by: str = None):
     conn = get_connection()
     cursor = conn.cursor()
+    # Delete all existing mappings for this client and file type before saving the new ones
+    # This prevents stale columns from previous uploads polluting the current mapping
+    cursor.execute(
+        "DELETE FROM column_mappings WHERE client_id = %s AND file_type = %s",
+        (client_id, file_type)
+    )
     for original_column, info in mapping.items():
         # Handle both old format (string) and new format (dict) to ensure backwards compatibility
         if isinstance(info, dict):
             mapped_to  = str(info.get("mapped_to", "unknown"))
             field_type = str(info.get("field_type", "unknown"))
+            reviewed_unknown = 1 if info.get("reviewed_unknown") else 0
+            required = 1 if info.get("required", True) else 0
         else:
             mapped_to  = str(info)
             field_type = "unknown"
-        # Insert new mapping or update existing one if the column already exists for this client and file type
+            reviewed_unknown = 0
+            required = 1
         cursor.execute("""
             INSERT INTO column_mappings
-                (client_id, file_type, original_column, mapped_to, field_type, confirmed_by, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                (client_id, file_type, original_column, mapped_to, field_type, reviewed_unknown, required, confirmed_by, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
             ON DUPLICATE KEY UPDATE
-                mapped_to    = VALUES(mapped_to),
-                field_type   = VALUES(field_type),
-                confirmed_by = VALUES(confirmed_by),
-                updated_at   = CURRENT_TIMESTAMP
-        """, (client_id, file_type, original_column, mapped_to, field_type, confirmed_by))
+                mapped_to        = VALUES(mapped_to),
+                field_type       = VALUES(field_type),
+                reviewed_unknown = VALUES(reviewed_unknown),
+                required         = VALUES(required),
+                confirmed_by     = VALUES(confirmed_by),
+                updated_at       = CURRENT_TIMESTAMP
+        """, (client_id, file_type, original_column, mapped_to, field_type, reviewed_unknown, required, confirmed_by))
     conn.commit()
     conn.close()
 
@@ -211,7 +230,7 @@ def get_mapping(client_id: str, file_type: str = "general") -> dict:
     cursor = conn.cursor(dictionary=True)
     # Fetch all saved mappings for this client and file type
     cursor.execute("""
-        SELECT original_column, mapped_to, field_type
+        SELECT original_column, mapped_to, field_type, reviewed_unknown, required
         FROM column_mappings
         WHERE client_id = %s AND file_type = %s
     """, (client_id, file_type))
@@ -223,8 +242,10 @@ def get_mapping(client_id: str, file_type: str = "general") -> dict:
     # Convert rows into a nested dict keyed by original column name
     return {
         row["original_column"]: {
-            "mapped_to":  row["mapped_to"],
-            "field_type": row["field_type"]
+            "mapped_to":       row["mapped_to"],
+            "field_type":      row["field_type"],
+            "reviewed_unknown": bool(row.get("reviewed_unknown", 0)),
+            "required":        bool(row.get("required", 1))
         }
         for row in rows
     }

@@ -1,0 +1,24 @@
+/* Global styles and CSS variables */
+
+:root {
+  --primary: #1E3A5F;
+  --secondary: #256D85;
+  --accent: #3A86FF;
+  --info: #2E86C1;
+  --background: #F4F6F9;
+  --surface: #FFFFFF;
+  --white: #FFFFFF;
+  --text: #263445;
+  --muted: #6B7280;
+  --border: #D8DEE8;
+  --success: #1F9D55;
+  --success-bg: #EAFAF1;
+  --success-border: #A7F3D0;
+  --warning: #F59E0B;
+  --warning-bg: #FEF9EC;
+  --warning-bg-light: #FFF8F0;
+  --warning-border: #FDE68A;
+  --danger: #DC2626;
+  --danger-bg: #FDEDEC;
+  --info-bg: #EBF5FB;
+}

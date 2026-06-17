@@ -16,7 +16,7 @@ import sys
 import shutil
 import secrets
 from dotenv import load_dotenv
-from detector import detect_columns_with_llm, build_detection_result
+from detector import detect_columns_with_llm, build_detection_result, suggest_file_type
 from database import init_db, get_db, save_mapping, get_mapping, save_upload, get_uploads
 from cleaner import clean_dataframe
 
@@ -110,19 +110,29 @@ def extract_docx(file_path: str):
         return pd.DataFrame({"raw_text": lines}), "text"
     return None, None
 
-# Read any supported uploaded file into a DataFrame based on its extension
+# Read any supported uploaded file into a DataFrame based on its extension.
+# Reads everything as string dtype to avoid pandas silently coercing values (e.g. "001" -> 1).
+# Drops fully-empty columns and strips whitespace consistently across upload, detect and clean
 def read_file_to_df(save_path: str, ext: str):
     if ext == "csv":
-        return pd.read_csv(save_path)
+        df = pd.read_csv(save_path, dtype=str)
     elif ext in ["xlsx", "xls"]:
-        return pd.read_excel(save_path)
+        df = pd.read_excel(save_path, dtype=str)
     elif ext == "pdf":
         df, _ = extract_pdf(save_path)
         return df
     elif ext == "docx":
         df, _ = extract_docx(save_path)
         return df
-    return None
+    else:
+        return None
+    # Drop completely empty columns consistently across upload, detect and clean
+    if df is not None:
+        df = df.dropna(axis=1, how='all')
+        df = df.loc[:, ~(df == '').all()]
+        # Strip whitespace and tab characters from all cells
+        df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
+    return df
 
 # Calculate fill rate per column. Fill rate is the percentage of rows that have a value (0.0 to 1.0)
 def calculate_fill_rates(df: pd.DataFrame) -> dict:
@@ -276,7 +286,12 @@ async def upload_file_ai(
                 "preview": df.head(5).fillna("").to_dict(orient="records"), "message": f"DOCX uploaded — extracted via {source}"}
     # Handle CSV and Excel files, read into DataFrame and return fill rates and preview
     try:
-        df = pd.read_csv(save_path) if ext == "csv" else pd.read_excel(save_path)
+        df = pd.read_csv(save_path, dtype=str) if ext == "csv" else pd.read_excel(save_path, dtype=str)
+        # Strip whitespace from all cells
+        df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
+        # Drop completely empty columns
+        df = df.dropna(axis=1, how='all')
+        df = df.loc[:, ~(df == '').all()]
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not read file: {str(e)}")
     save_upload(file_id, client_id, file.filename, ext, len(df))
@@ -285,7 +300,9 @@ async def upload_file_ai(
             "rows": len(df), "columns": list(df.columns), "fill_rates": fill_rates,
             "preview": df.head(5).fillna("").to_dict(orient="records"), "message": "File uploaded and processed successfully"}
 
-# Detect column meanings using LLM. First checks if client has a saved mapping, if yes, skips LLM entirely.If no saved mapping is found, reads the file, extracts sample values and runs LLM detection
+# Detect column meanings using LLM. First checks if client has a saved mapping, if yes, skips LLM entirely.If no saved mapping is found, reads the file, extracts sample values and runs LLM detection.
+# Also suggests a file_type category based on the columns, so the auditor can confirm/correct it on the mapping page
+# instead of every upload being saved under the same hardcoded "general" bucket.
 @app.post("/detect-columns")
 async def detect_columns_endpoint(
     client_id: str = Form(...),
@@ -304,18 +321,8 @@ async def detect_columns_endpoint(
         fill_rates_dict = json.loads(fill_rates)
     except json.JSONDecodeError:
         fill_rates_dict = {}
-    # Check if client already has a confirmed mapping saved in the database. If all columns are mapped, skip LLM
-    saved_mapping = get_mapping(client_id, file_type)
-    if saved_mapping:
-        all_mapped = all(col in saved_mapping for col in columns_list)
-        if all_mapped:
-            filtered_mapping = {col: saved_mapping[col] for col in columns_list}
-            result = build_detection_result(columns_list, filtered_mapping)
-            result["file_id"] = file_id
-            result["source"] = "saved_mapping"
-            result["message"] = "Mapping loaded from saved client profile — LLM skipped."
-            return result
-    # No saved mapping found, locate the uploaded file on disk
+    # Read the file early so sample_values are available for both the saved_mapping branch and the LLM branch below.
+    # This also lets us enrich saved mappings with fresh sample/fill_rate context instead of returning bare mapped_to/field_type
     save_path = None
     file_ext = None
     for extension in ALLOWED_EXTENSIONS:
@@ -326,7 +333,7 @@ async def detect_columns_endpoint(
             break
     if not save_path:
         raise HTTPException(status_code=404, detail="File not found. Please upload the file first.")
-    # Read file and extract first non-empty sample value per column to give LLM context
+    # Read file and extract first non-empty sample value per column. Used to give the LLM context and to enrich the response for the frontend
     try:
         df = read_file_to_df(save_path, file_ext)
         if df is None:
@@ -340,14 +347,41 @@ async def detect_columns_endpoint(
                 sample_values[col] = ""
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not read file: {str(e)}")
+    # Suggest a file_type category from the fixed list based on the actual columns and sample values.
+    # This runs regardless of which branch below executes, so the auditor always sees a suggestion to confirm or correct
+    try:
+        file_type_suggestion = suggest_file_type(columns_list, sample_values)
+    except Exception:
+        # If classification fails for any reason, fall back to "other" rather than failing the whole request —
+        # column detection is the primary feature, file_type suggestion should never block it
+        file_type_suggestion = {"file_type": "other", "file_type_label": "Other"}
+    # Check if client already has a confirmed mapping saved in the database. If all columns are mapped, skip LLM
+    saved_mapping = get_mapping(client_id, file_type)
+    if saved_mapping:
+        all_mapped = all(col in saved_mapping for col in columns_list)
+        if all_mapped:
+            filtered_mapping = {col: saved_mapping[col] for col in columns_list}
+            # Pass sample_values and fill_rates_dict so the frontend gets full per-column context even when the mapping is loaded from the saved profile
+            result = build_detection_result(columns_list, filtered_mapping, sample_values, fill_rates_dict)
+            result["file_id"] = file_id
+            result["source"] = "saved_mapping"
+            result["message"] = "Mapping loaded from saved client profile — LLM skipped."
+            # Include the suggestion anyway so the frontend can show it, even though this upload reused an existing mapping
+            result["suggested_file_type"] = file_type_suggestion["file_type"]
+            result["suggested_file_type_label"] = file_type_suggestion["file_type_label"]
+            return result
     # Run LLM detection passing column names, sample values and fill rates as context
     try:
         mapping = detect_columns_with_llm(columns_list, sample_values, fill_rates_dict)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Detection failed: {str(e)}")
-    result = build_detection_result(columns_list, mapping)
+    # Pass sample_values and fill_rates_dict so each column in the response carries its sample value and fill rate for the frontend review step
+    result = build_detection_result(columns_list, mapping, sample_values, fill_rates_dict)
     result["file_id"] = file_id
     result["source"] = "llm_detection"
+    # Include the file_type suggestion so the auditor can confirm or correct it before saving the mapping
+    result["suggested_file_type"] = file_type_suggestion["file_type"]
+    result["suggested_file_type_label"] = file_type_suggestion["file_type_label"]
     return result
 
 # Save a confirmed column mapping for a client so future uploads skip LLM detection
@@ -420,7 +454,7 @@ async def clean_file(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Cleaning failed: {str(e)}")
     return {"file_id": file_id, "client_id": client_id, "file_type": file_type,
-            "cleaned_data": cleaned_df.fillna("").to_dict(orient="records"),
+            "cleaned_data": cleaned_df.fillna("").astype(str).applymap(lambda x: x.strip()).to_dict(orient="records"),
             "validation_report": report, "message": "File cleaned successfully."}
 
 # MANAGEMENT ROUTES  
@@ -913,3 +947,6 @@ if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
 
+
+
+    

@@ -1,0 +1,134 @@
+/* CleanPage Styles */
+
+.stats-grid {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 12px;
+    margin-bottom: 24px;
+}
+
+.stat-card {
+    background: var(--background);
+    border-radius: 10px;
+    padding: 16px 12px;
+    text-align: center;
+    border: 1px solid #E5E8EC;
+}
+
+.stat-clean {
+    border-top: 3px solid var(--success);
+}
+
+.stat-flagged {
+    border-top: 3px solid var(--warning);
+}
+
+.stat-high {
+    border-top: 3px solid var(--danger);
+}
+
+.stat-medium {
+    border-top: 3px solid var(--warning);
+}
+
+.stat-value {
+    font-size: 28px;
+    font-weight: 700;
+    color: var(--primary);
+}
+
+.stat-label {
+    font-size: 11px;
+    color: #888;
+    font-weight: 600;
+    text-transform: uppercase;
+    margin-top: 4px;
+}
+
+.issues-title {
+    color: var(--primary);
+    font-size: 15px;
+    font-weight: 600;
+    margin-bottom: 12px;
+    margin-top: 8px;
+}
+
+.issues-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-height: 400px;
+    overflow-y: auto;
+}
+
+.issue-row {
+    padding: 10px 14px;
+    border-radius: 8px;
+    border-left: 4px solid;
+}
+
+.issue-high {
+    background: #FDEDEC;
+    border-color: var(--danger);
+}
+
+.issue-medium {
+    background: #FEF9E7;
+    border-color: var(--warning);
+}
+
+.issue-info {
+    background: #EBF5FB;
+    border-color: var(--accent);
+}
+
+.issue-meta {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 4px;
+}
+
+.issue-badge {
+    font-size: 10px;
+    font-weight: 700;
+    padding: 2px 8px;
+    border-radius: 20px;
+    background: rgba(0,0,0,0.08);
+}
+
+.issue-location {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text);
+}
+
+.issue-message {
+    font-size: 12px;
+    color: var(--text);
+}
+
+.issue-value {
+    font-size: 11px;
+    color: #888;
+    margin-top: 2px;
+}
+
+.all-clean {
+    background: #EAFAF1;
+    color: var(--success);
+    padding: 14px 16px;
+    border-radius: 8px;
+    font-weight: 600;
+    font-size: 14px;
+}
+
+.row-flagged {
+    background: #FDEDEC !important;
+}
+
+.mapping-note {
+    color: #888;
+    font-size: 13px;
+    margin-bottom: 16px;
+}

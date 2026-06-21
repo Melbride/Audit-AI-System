@@ -12,7 +12,7 @@ const API = axios.create({
 // Upload a file for a client
 export const uploadFile = (formData) => 
     API.post('/upload', formData, {
-        headers: { 'Content-Type': 'multipart/form-data'}
+        headers: { 'Content-Type': 'multipart/form-data' }
     })
 
 // Save confirmed column mapping for a client
@@ -38,10 +38,26 @@ export const cleanFile = (formData) =>
         headers: { 'Content-Type': 'multipart/form-data' }
     })
 
+export const acknowledgeIssue = (formData) =>
+    API.post('/clean/acknowledge', formData, {
+        headers: { 'Content-Type': 'multipart/form-data' }
+    })
+
+export const submitInlineCorrections = (formData) =>
+    API.post('/clean/inline-corrections', formData, {
+        headers: { 'Content-Type': 'multipart/form-data' }
+    })
+
+export const submitCorrectedFile = (formData) =>
+    API.post('/clean/submit-corrected-file', formData, {
+        headers: { 'Content-Type': 'multipart/form-data' }
+    })
+
+export const correctionExportUrl = (fileId, clientId, fileType = 'general') =>
+    `${API.defaults.baseURL}/clean/export-corrections/${fileId}?client_id=${encodeURIComponent(clientId)}&file_type=${encodeURIComponent(fileType)}`
+
 // Get upload history for a client
 export const getUploads = (clientId) =>
     API.get(`/uploads/${clientId}`)
 
 export default API
-
-

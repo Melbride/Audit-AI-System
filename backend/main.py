@@ -1,5 +1,7 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, StreamingResponse
+# from fastapi.responses import FileResponse
 from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel
 from typing import Optional, Literal
@@ -15,10 +17,24 @@ import os
 import sys
 import shutil
 import secrets
+import hashlib
 from dotenv import load_dotenv
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Protection
+from openpyxl.utils import get_column_letter
 from detector import detect_columns_with_llm, build_detection_result, suggest_file_type
-from database import init_db, get_db, save_mapping, get_mapping, save_upload, get_uploads
+from database import (
+    init_db, get_db, save_mapping, get_mapping, save_upload, get_uploads,
+    save_cleaning_acknowledgment, get_acknowledged_issue_ids,
+    save_cleaning_corrections, get_cleaning_corrections,
+    save_cleaning_snapshot, get_cleaning_snapshot,
+)
 from cleaner import clean_dataframe
+from excel_export import build_cleaning_workbook
+from openpyxl.styles import Font, PatternFill, Protection, Alignment
+from database import save_fingerprint, get_fingerprint
+from validators.mapping_validator import validate_mapping_no_duplicates
+
 
 # Load environment variables from .env file
 load_dotenv()
@@ -131,7 +147,7 @@ def read_file_to_df(save_path: str, ext: str):
         df = df.dropna(axis=1, how='all')
         df = df.loc[:, ~(df == '').all()]
         # Strip whitespace and tab characters from all cells
-        df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
+        df = df.map(lambda x: x.strip() if isinstance(x, str) else x)
     return df
 
 # Calculate fill rate per column. Fill rate is the percentage of rows that have a value (0.0 to 1.0)
@@ -142,6 +158,127 @@ def calculate_fill_rates(df: pd.DataFrame) -> dict:
         filled = df[col].replace("", float("nan")).dropna().count()
         fill_rates[col] = round(filled / total, 2) if total > 0 else 0.0
     return fill_rates
+
+def compute_schema_fingerprint(columns: list) -> str:
+    """
+    Compute a fingerprint for a file's column structure.
+    Same columns in any order = same fingerprint.
+    Any column added/removed/renamed = different fingerprint.
+    """
+    sorted_cols = sorted([col.lower().strip() for col in columns])
+    fingerprint = hashlib.md5(json.dumps(sorted_cols).encode()).hexdigest()
+    return fingerprint
+
+def locate_uploaded_file(file_id: str):
+    for extension in ALLOWED_EXTENSIONS:
+        path = os.path.join(UPLOAD_DIR, f"{file_id}.{extension}")
+        if os.path.exists(path):
+            return path, extension
+    return None, None
+
+def normalize_header_label(value) -> str:
+    label = str(value or "").strip()
+    if label.startswith("[UNRESOLVED]"):
+        label = label.replace("[UNRESOLVED]", "", 1).strip()
+    return label
+
+def issue_fingerprint(file_id: str, client_id: str, file_type: str, issue: dict) -> str:
+    raw = "|".join([
+        str(file_id),
+        str(client_id),
+        str(file_type),
+        str(issue.get("row_index", "")),
+        str(issue.get("column", "")),
+        str(issue.get("original_value", "")),
+        str(issue.get("issue", "")),
+    ])
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+def enrich_issues_with_ids(report: dict, file_id: str, client_id: str, file_type: str) -> dict:
+    for issue in report.get("issues", []):
+        issue["issue_id"] = issue_fingerprint(file_id, client_id, file_type, issue)
+        issue["decision"] = "pending"
+    return report
+
+def rebuild_report_counts(report: dict) -> dict:
+    issues = report.get("issues", [])
+    total_rows = report.get("total_rows", 0)
+    flagged_rows = len(set(
+        issue.get("row_index")
+        for issue in issues
+        if issue.get("row_index") != "N/A"
+    ))
+    report["flagged_rows"] = flagged_rows
+    report["clean_rows"] = max(total_rows - flagged_rows, 0)
+    report["total_issues"] = len(issues)
+    report["high_issues"] = len([i for i in issues if i.get("severity") == "high"])
+    report["medium_issues"] = len([i for i in issues if i.get("severity") == "medium"])
+    report["info_issues"] = len([i for i in issues if i.get("severity") == "info"])
+    return report
+
+def filter_acknowledged_issues(report: dict, file_id: str, client_id: str, file_type: str) -> dict:
+    acknowledged = get_acknowledged_issue_ids(file_id, client_id, file_type)
+    if not acknowledged:
+        return report
+    report["issues"] = [
+        issue for issue in report.get("issues", [])
+        if issue.get("issue_id") not in acknowledged
+    ]
+    return rebuild_report_counts(report)
+
+def apply_saved_corrections(df: pd.DataFrame, mapping: dict, corrections: list) -> pd.DataFrame:
+    if not corrections:
+        return df
+    standard_to_original = {
+        info.get("mapped_to"): original_col
+        for original_col, info in mapping.items()
+        if isinstance(info, dict) and info.get("mapped_to") not in ("", "unknown", None)
+    }
+    for correction in corrections:
+        row_index = int(correction["row_index"])
+        issue_col = correction["column_name"]
+        source_col = standard_to_original.get(issue_col, issue_col)
+        if source_col in df.columns and row_index in df.index:
+            df.at[row_index, source_col] = correction["corrected_value"]
+    return df
+
+def adapt_mapping_to_uploaded_headers(mapping: dict, columns: list) -> dict:
+    adapted = {}
+    column_set = set(columns)
+    for original_col, info in mapping.items():
+        if not isinstance(info, dict):
+            adapted[original_col] = info
+            continue
+        mapped_to = info.get("mapped_to")
+        if original_col in column_set:
+            adapted[original_col] = info
+        elif mapped_to and mapped_to != "unknown" and mapped_to in column_set:
+            adapted[mapped_to] = {**info, "mapped_to": mapped_to}
+        else:
+            adapted[original_col] = info
+    return adapted
+
+def run_cleaning_cycle(file_id: str, client_id: str, file_type: str, mapping: dict):
+    save_path, file_ext = locate_uploaded_file(file_id)
+    if not save_path:
+        raise HTTPException(status_code=404, detail="File not found. Please upload the file first.")
+    try:
+        df = read_file_to_df(save_path, file_ext)
+        if df is None:
+            raise HTTPException(status_code=400, detail="Could not read file.")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not read file: {str(e)}")
+
+    corrections = get_cleaning_corrections(file_id, client_id, file_type)
+    df = apply_saved_corrections(df, mapping, corrections)
+    fill_rates = calculate_fill_rates(df)
+    try:
+        cleaned_df, report = clean_dataframe(df, mapping, fill_rates)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Cleaning failed: {str(e)}")
+    report = enrich_issues_with_ids(report, file_id, client_id, file_type)
+    report = filter_acknowledged_issues(report, file_id, client_id, file_type)
+    return cleaned_df, report
 
 # Models for request validation. Pydantic models define the shape of data coming into each endpoint
 class Client(BaseModel):
@@ -288,7 +425,7 @@ async def upload_file_ai(
     try:
         df = pd.read_csv(save_path, dtype=str) if ext == "csv" else pd.read_excel(save_path, dtype=str)
         # Strip whitespace from all cells
-        df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
+        df = df.map(lambda x: x.strip() if isinstance(x, str) else x)
         # Drop completely empty columns
         df = df.dropna(axis=1, how='all')
         df = df.loc[:, ~(df == '').all()]
@@ -296,33 +433,50 @@ async def upload_file_ai(
         raise HTTPException(status_code=400, detail=f"Could not read file: {str(e)}")
     save_upload(file_id, client_id, file.filename, ext, len(df))
     fill_rates = calculate_fill_rates(df)
+    # Compute schema fingerprint for this file structure
+    # fingerprint = compute_schema_fingerprint(list(df.columns))
+    # Save fingerprint to database
+    # save_fingerprint(client_id, fingerprint, ext, list(df.columns))
     return {"file_id": file_id, "client_id": client_id, "filename": file.filename, "source": "table",
             "rows": len(df), "columns": list(df.columns), "fill_rates": fill_rates,
-            "preview": df.head(5).fillna("").to_dict(orient="records"), "message": "File uploaded and processed successfully"}
+            "fingerprint": compute_schema_fingerprint(list(df.columns)), "preview": df.head(5).fillna("").to_dict(orient="records"), "message": "File uploaded and processed successfully"}
+
 
 # Detect column meanings using LLM. First checks if client has a saved mapping, if yes, skips LLM entirely.If no saved mapping is found, reads the file, extracts sample values and runs LLM detection.
 # Also suggests a file_type category based on the columns, so the auditor can confirm/correct it on the mapping page
 # instead of every upload being saved under the same hardcoded "general" bucket.
+#
+# IMPORTANT: the saved-mapping lookup uses the freshly-suggested file_type, not the incoming
+# file_type form parameter. The frontend cannot know the correct file_type before this call
+# returns a suggestion (file_type is only known AFTER the AI looks at the columns), so trusting
+# the incoming parameter for the lookup would almost always miss a real saved mapping and
+# re-run the LLM unnecessarily on every upload, even repeat uploads of the same file type.
+#
+# This is also the correct place to save the schema fingerprint — /upload only knows the
+# file extension at save time, not the real file_type category, which is only computed here.
 @app.post("/detect-columns")
 async def detect_columns_endpoint(
     client_id: str = Form(...),
     file_id: str = Form(...),
     columns: str = Form(...),
     file_type: str = Form("general"),
-    fill_rates: str = Form("{}")
+    fill_rates: str = Form("{}"),
+    fingerprint: str = Form("")
 ):
+
     # Parse columns list from JSON string sent by frontend
     try:
         columns_list = json.loads(columns)
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Invalid columns format.")
+
     # Parse fill rates from JSON string sent by frontend
     try:
         fill_rates_dict = json.loads(fill_rates)
     except json.JSONDecodeError:
         fill_rates_dict = {}
-    # Read the file early so sample_values are available for both the saved_mapping branch and the LLM branch below.
-    # This also lets us enrich saved mappings with fresh sample/fill_rate context instead of returning bare mapped_to/field_type
+
+    # Find the uploaded file on disk
     save_path = None
     file_ext = None
     for extension in ALLOWED_EXTENSIONS:
@@ -333,7 +487,8 @@ async def detect_columns_endpoint(
             break
     if not save_path:
         raise HTTPException(status_code=404, detail="File not found. Please upload the file first.")
-    # Read file and extract first non-empty sample value per column. Used to give the LLM context and to enrich the response for the frontend
+
+    # Read file and extract first non-empty sample value per column
     try:
         df = read_file_to_df(save_path, file_ext)
         if df is None:
@@ -347,43 +502,154 @@ async def detect_columns_endpoint(
                 sample_values[col] = ""
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not read file: {str(e)}")
-    # Suggest a file_type category from the fixed list based on the actual columns and sample values.
-    # This runs regardless of which branch below executes, so the auditor always sees a suggestion to confirm or correct
+
+    # Suggest a file_type category based on columns and sample values.
+    # This MUST run before the saved-mapping lookup below, since the lookup needs this value.
     try:
         file_type_suggestion = suggest_file_type(columns_list, sample_values)
     except Exception:
-        # If classification fails for any reason, fall back to "other" rather than failing the whole request —
-        # column detection is the primary feature, file_type suggestion should never block it
         file_type_suggestion = {"file_type": "other", "file_type_label": "Other"}
-    # Check if client already has a confirmed mapping saved in the database. If all columns are mapped, skip LLM
-    saved_mapping = get_mapping(client_id, file_type)
+
+    # Use the freshly suggested file_type for the saved-mapping lookup, not the raw incoming
+    # file_type parameter. On a client's first ever upload the frontend has no real file_type
+    # yet (it only learns one from this response), and on later uploads the frontend's stored
+    # file_type can be stale from a previous session — the suggestion computed just above is
+    # always derived fresh from this file's actual columns, so it's the reliable lookup key.
+    effective_file_type = file_type_suggestion["file_type"]
+
+    # Compute the schema fingerprint once, here, now that the real file_type is known.
+    computed_fingerprint = compute_schema_fingerprint(columns_list)
+
+    # Save the fingerprint using the real file_type category, not a file extension placeholder.
+    # /upload cannot do this correctly since it runs before file_type is ever determined.
+    save_fingerprint(client_id, computed_fingerprint, effective_file_type, columns_list)
+
+    print("🔥 DETECT-COLUMNS HIT")
+    print("CLIENT ID:", client_id)
+    print("COLUMNS:", columns_list)
+    print("EFFECTIVE FILE TYPE FOR LOOKUP:", effective_file_type)
+
+    # Check fingerprint cache and saved mapping, both keyed on the effective (suggested) file_type
+    saved_mapping = get_mapping(client_id, effective_file_type)
+    existing_fp = get_fingerprint(client_id, computed_fingerprint, effective_file_type)
+
+    # =========================
+    # 1. CACHE PATH
+    # =========================
+    if existing_fp and saved_mapping:
+        filtered_mapping = {
+            col: saved_mapping.get(col)
+            for col in columns_list
+            if col in saved_mapping
+        }
+        result = build_detection_result(
+            columns_list,
+            filtered_mapping,
+            sample_values,
+            fill_rates_dict
+        )
+        result["file_id"] = file_id
+        result["source"] = "fingerprint_cache"
+        result["message"] = "Mapping reused from cache."
+        result["suggested_file_type"] = file_type_suggestion["file_type"]
+        result["suggested_file_type_label"] = file_type_suggestion["file_type_label"]
+        return result
+
+    # Also check the saved mapping directly (covers the case where the fingerprint wasn't
+    # recorded yet but a mapping already exists for this client + suggested file_type, e.g.
+    # the very first detect call right after upload before any fingerprint write happened)
     if saved_mapping:
         all_mapped = all(col in saved_mapping for col in columns_list)
         if all_mapped:
             filtered_mapping = {col: saved_mapping[col] for col in columns_list}
-            # Pass sample_values and fill_rates_dict so the frontend gets full per-column context even when the mapping is loaded from the saved profile
             result = build_detection_result(columns_list, filtered_mapping, sample_values, fill_rates_dict)
             result["file_id"] = file_id
             result["source"] = "saved_mapping"
             result["message"] = "Mapping loaded from saved client profile — LLM skipped."
-            # Include the suggestion anyway so the frontend can show it, even though this upload reused an existing mapping
             result["suggested_file_type"] = file_type_suggestion["file_type"]
             result["suggested_file_type_label"] = file_type_suggestion["file_type_label"]
             return result
-    # Run LLM detection passing column names, sample values and fill rates as context
+
+    # =========================
+    # 2. LLM PATH
+    # =========================
     try:
-        mapping = detect_columns_with_llm(columns_list, sample_values, fill_rates_dict)
+        mapping = detect_columns_with_llm(
+            columns_list,
+            sample_values,
+            fill_rates_dict
+        )
+
+        if not mapping:
+            raise HTTPException(status_code=500, detail="LLM returned empty mapping.")
+
+        # Build result first
+        result = build_detection_result(
+            columns_list,
+            mapping,
+            sample_values,
+            fill_rates_dict
+        )
+
+        # De-duplicate mappings gracefully — if two original columns map to the same
+        # standard name, keep the first one and demote the rest to "unknown" with a
+        # suggestion. This prevents a 422 crash and lets the auditor fix it in the UI.
+        dedup_warnings = []
+        seen_targets = set()
+        for original_col, info in list(result["mapping"].items()):
+            if not isinstance(info, dict):
+                continue
+            target = str(info.get("mapped_to", "")).strip()
+            if target in ("", "unknown"):
+                continue
+            if target in seen_targets:
+                suggestion = target
+                result["mapping"][original_col] = {
+                    "mapped_to": "unknown",
+                    "field_type": "unknown",
+                    "suggestion": suggestion,
+                    "sample_value": info.get("sample_value", ""),
+                    "fill_rate": info.get("fill_rate", 1.0),
+                }
+                dedup_warnings.append(
+                    f"'{original_col}' was also mapped to '{target}' — demoted to unknown. "
+                    f"Please give it a unique 'Mapped To' name."
+                )
+            else:
+                seen_targets.add(target)
+
+        # Recalculate unknown count and warnings after de-duplication
+        unknown_columns = [
+            col for col, info in result["mapping"].items()
+            if info.get("mapped_to") == "unknown" or info.get("field_type") == "unknown"
+        ]
+        result["unknown_count"] = len(unknown_columns)
+        result["requires_manual_mapping"] = len(unknown_columns) > 0
+        if dedup_warnings:
+            if "warnings" in result and isinstance(result["warnings"], list):
+                result["warnings"].extend(
+                    {"type": "dedup_mapping", "message": w, "action": "Please update the mapped-to field to a unique name."}
+                    for w in dedup_warnings
+                )
+            else:
+                result["warnings"] = [
+                    {"type": "dedup_mapping", "message": w, "action": "Please update the mapped-to field to a unique name."}
+                    for w in dedup_warnings
+                ]
+        if result.get("warnings"):
+            result["warning_count"] = len(result["warnings"])
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Detection failed: {str(e)}")
-    # Pass sample_values and fill_rates_dict so each column in the response carries its sample value and fill rate for the frontend review step
-    result = build_detection_result(columns_list, mapping, sample_values, fill_rates_dict)
+
     result["file_id"] = file_id
     result["source"] = "llm_detection"
-    # Include the file_type suggestion so the auditor can confirm or correct it before saving the mapping
     result["suggested_file_type"] = file_type_suggestion["file_type"]
     result["suggested_file_type_label"] = file_type_suggestion["file_type_label"]
-    return result
 
+    return result
 # Save a confirmed column mapping for a client so future uploads skip LLM detection
 @app.post("/save-mapping")
 async def save_mapping_endpoint(
@@ -430,32 +696,55 @@ async def clean_file(
     mapping = get_mapping(client_id, file_type)
     if not mapping:
         raise HTTPException(status_code=400, detail="No saved mapping found for this client. Please detect the columns and confirm the mapping first.")
-    # Locate the uploaded file on disk
-    save_path = None
-    file_ext = None
-    for extension in ALLOWED_EXTENSIONS:
-        path = os.path.join(UPLOAD_DIR, f"{file_id}.{extension}")
-        if os.path.exists(path):
-            save_path = path
-            file_ext = extension
-            break
-    if not save_path:
-        raise HTTPException(status_code=404, detail="File not found. Please upload the file first.")
-    # Read file into DataFrame
-    try:
-        df = read_file_to_df(save_path, file_ext)
-        if df is None:
-            raise HTTPException(status_code=400, detail="Could not read file.")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not read file: {str(e)}")
-    # Run the cleaner using the confirmed mapping and return cleaned data with a validation report
-    try:
-        cleaned_df, report = clean_dataframe(df, mapping)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Cleaning failed: {str(e)}")
+    cleaned_df, report = run_cleaning_cycle(file_id, client_id, file_type, mapping)
     return {"file_id": file_id, "client_id": client_id, "file_type": file_type,
-            "cleaned_data": cleaned_df.fillna("").astype(str).applymap(lambda x: x.strip()).to_dict(orient="records"),
-            "validation_report": report, "message": "File cleaned successfully."}
+            "cleaned_data": cleaned_df.fillna("").astype(str).map(lambda x: x.strip()).to_dict(orient="records"),
+            "validation_report": report,
+            "can_proceed": report.get("total_issues", 0) == 0,
+            "message": "File cleaned successfully."}
+
+@app.get("/clean/export-cleaned/{file_id}")
+async def export_cleaned_workbook(file_id: str, client_id: str, file_type: str = "general"):
+
+    mapping = get_mapping(client_id, file_type)
+    if not mapping:
+        raise HTTPException(status_code=400, detail="No saved mapping found")
+
+    cleaned_df, report = run_cleaning_cycle(file_id, client_id, file_type, mapping)
+    save_cleaning_snapshot(file_id, client_id, file_type, cleaned_df)
+    workbook_buffer = build_cleaning_workbook(cleaned_df, report, mapping)
+
+    #confirm it's a real Excel file
+    content = workbook_buffer.getvalue()
+    print("FILE SIZE:", len(content))
+
+    from fastapi.responses import Response
+
+    return Response(
+        content=workbook_buffer.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename={file_id}.xlsx'}
+    )
+
+# @app.post("/reupload-corrections")
+# async def reupload_corrected_file(
+#     file: UploadFile = File(...),
+#     file_id: str = Form(...),
+#     client_id: str = Form(...),
+#     file_type: str = Form("general")
+# ):
+#     df = pd.read_excel(file.file, dtype=str)
+#     df = df.map(lambda x: x.strip() if isinstance(x, str) else x)
+
+#     # Load mapping again
+#     mapping = get_mapping(client_id, file_type)
+#     if not mapping:
+#         raise HTTPException(status_code=400, detail="No mapping found")
+    
+#     # Run cleaning again to reuse the existing pipeline
+#     fill_rates = calculate_fill_rates(df)
+#     cleaned_df, report = clean_dataframe(df, mapping, fill_rates)
+
 
 # MANAGEMENT ROUTES  
 # Create a router for all management routes. This router is registered into the main app at the bottom
@@ -946,7 +1235,6 @@ app.include_router(audit_router)
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
-
 
 
     

@@ -47,12 +47,12 @@ function MappingPage() {
         setError(null)
         try {
             const formData = new FormData()
-            formData.append('client_id', clientId)
+            formData.append('client_id', String(clientId))
             formData.append('file_id', uploadResult.file_id)
             formData.append('columns', JSON.stringify(uploadResult.columns))
-            formData.append('fill_rates', JSON.stringify(uploadResult.fill_rates))
-            formData.append('file_type', 'general')
-
+            formData.append('fill_rates', JSON.stringify(uploadResult.fill_rates || {}))
+            formData.append('fingerprint', uploadResult.fingerprint || '')
+            formData.append('file_type', fileType)
             const response = await detectColumns(formData)
             setMapping(response.data.mapping)
             if (response.data.suggested_file_type) {

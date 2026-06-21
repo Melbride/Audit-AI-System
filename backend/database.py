@@ -67,6 +67,21 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    
+    # Schema fingerprints table
+    # Stores column structure fingerprints per client
+    # So same file structure reuses existing mapping automatically
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS schema_fingerprints (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            client_id VARCHAR(255) NOT NULL,
+            fingerprint VARCHAR(255) NOT NULL,
+            file_type VARCHAR(100) NOT NULL DEFAULT 'general',
+            columns_snapshot TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE KEY uq_fingerprint (client_id, fingerprint)
+)
+""")
     # Users table. Stores system users including auditors, accountants and admins.Email must be unique. Password is stored as a hash, never plain text
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
@@ -181,8 +196,62 @@ def init_db():
     if cursor.fetchone()["count"] == 0:
         cursor.execute("ALTER TABLE uploads ADD COLUMN upload_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
 
+    # Auditor acknowledgments for issues that are valid as-is. These suppress the same issue
+    # on future cleaning runs for the same uploaded file.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS cleaning_acknowledgments (
+            id              INT AUTO_INCREMENT PRIMARY KEY,
+            issue_id        VARCHAR(64) NOT NULL UNIQUE,
+            file_id         VARCHAR(255) NOT NULL,
+            client_id       VARCHAR(255) NOT NULL,
+            file_type       VARCHAR(100) NOT NULL,
+            row_index       VARCHAR(50),
+            excel_row       VARCHAR(50),
+            column_name     VARCHAR(255),
+            original_value  TEXT,
+            issue_message   TEXT,
+            acknowledged_by VARCHAR(255),
+            created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # Cleaning snapshots table. Stores the cleaned data exactly as it looked when the
+    # Excel was downloaded, so a later re-uploaded corrected file can be compared
+    # against the exact data the auditor started editing from.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS cleaning_snapshots (
+            file_id       VARCHAR(255) NOT NULL,
+            client_id     VARCHAR(255) NOT NULL,
+            file_type     VARCHAR(100) NOT NULL,
+            snapshot_data LONGTEXT NOT NULL,
+            created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (file_id, client_id, file_type)
+        )
+    """)
+
+    # Inline corrections made by the auditor on the cleaning results screen.
+    # Corrections are applied to the source dataframe before each subsequent clean run.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS cleaning_corrections (
+            id             INT AUTO_INCREMENT PRIMARY KEY,
+            file_id        VARCHAR(255) NOT NULL,
+            client_id      VARCHAR(255) NOT NULL,
+            file_type      VARCHAR(100) NOT NULL,
+            row_index      INT NOT NULL,
+            column_name    VARCHAR(255) NOT NULL,
+            original_value TEXT,
+            corrected_value TEXT,
+            corrected_by   VARCHAR(255),
+            created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            UNIQUE KEY uq_cleaning_correction (file_id(64), client_id(64), file_type(64), row_index, column_name(191))
+        )
+    """)
+
     conn.commit()
     conn.close()
+
+    
 
 # Save a confirmed column mapping for a client to the database.
 # Mapping is a dict of { "original_column": { "mapped_to": "amount", "field_type": "numeric" } }
@@ -222,6 +291,44 @@ def save_mapping(client_id: str, file_type: str, mapping: dict, confirmed_by: st
         """, (client_id, file_type, original_column, mapped_to, field_type, reviewed_unknown, required, confirmed_by))
     conn.commit()
     conn.close()
+
+
+def save_fingerprint(client_id: str, fingerprint: str, file_type: str, columns: list):
+    import json
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        INSERT INTO schema_fingerprints
+            (client_id, fingerprint, file_type, columns_snapshot)
+        VALUES (%s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE id = id
+    """, (
+        client_id,
+        fingerprint,
+        file_type,
+        json.dumps(columns)
+    ))
+
+    conn.commit()
+    conn.close()
+
+def get_fingerprint(client_id: str, fingerprint: str, file_type: str = "general") -> bool:
+    """
+    Check if a schema fingerprint already exists for a client AND file type.
+    Filtering by file_type prevents two different file types that happen to share
+    the same column-name structure from incorrectly matching each other's cache entry.
+    Returns True if found, False if new structure.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id FROM schema_fingerprints
+        WHERE client_id = %s AND fingerprint = %s AND file_type = %s
+    """, (client_id, fingerprint, file_type))
+    result = cursor.fetchone()
+    conn.close()
+    return result is not None
 
 # Retrieve the saved column mapping for a client and file type from the database.Returns a dict of { "original_column": { "mapped_to": "amount", "field_type": "numeric" } }
 # Returns empty dict if no mapping has been saved for this client yet
@@ -276,3 +383,131 @@ def get_uploads(client_id: str) -> list:
     rows = cursor.fetchall()
     conn.close()
     return [dict(row) for row in rows]
+
+def save_cleaning_acknowledgment(
+    issue_id: str,
+    file_id: str,
+    client_id: str,
+    file_type: str,
+    issue: dict,
+    acknowledged_by: str = None,
+):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO cleaning_acknowledgments
+            (issue_id, file_id, client_id, file_type, row_index, excel_row, column_name,
+             original_value, issue_message, acknowledged_by)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE
+            acknowledged_by = VALUES(acknowledged_by),
+            created_at = CURRENT_TIMESTAMP
+    """, (
+        issue_id,
+        file_id,
+        client_id,
+        file_type,
+        str(issue.get("row_index", "")),
+        str(issue.get("row", "")),
+        issue.get("column"),
+        str(issue.get("original_value", "")),
+        issue.get("issue"),
+        acknowledged_by,
+    ))
+    conn.commit()
+    conn.close()
+
+def get_acknowledged_issue_ids(file_id: str, client_id: str, file_type: str) -> set:
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("""
+        SELECT issue_id FROM cleaning_acknowledgments
+        WHERE file_id = %s AND client_id = %s AND file_type = %s
+    """, (file_id, client_id, file_type))
+    rows = cursor.fetchall()
+    conn.close()
+    return {row["issue_id"] for row in rows}
+
+def save_cleaning_corrections(
+    file_id: str,
+    client_id: str,
+    file_type: str,
+    corrections: list,
+    corrected_by: str = None,
+):
+    conn = get_connection()
+    cursor = conn.cursor()
+    for correction in corrections:
+        cursor.execute("""
+            INSERT INTO cleaning_corrections
+                (file_id, client_id, file_type, row_index, column_name, original_value,
+                 corrected_value, corrected_by)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                original_value = VALUES(original_value),
+                corrected_value = VALUES(corrected_value),
+                corrected_by = VALUES(corrected_by),
+                updated_at = CURRENT_TIMESTAMP
+        """, (
+            file_id,
+            client_id,
+            file_type,
+            int(correction["row_index"]),
+            correction["column"],
+            str(correction.get("original_value", "")),
+            str(correction.get("corrected_value", "")),
+            corrected_by,
+        ))
+    conn.commit()
+    conn.close()
+
+def get_cleaning_corrections(file_id: str, client_id: str, file_type: str) -> list:
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("""
+        SELECT row_index, column_name, corrected_value
+        FROM cleaning_corrections
+        WHERE file_id = %s AND client_id = %s AND file_type = %s
+    """, (file_id, client_id, file_type))
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+
+def save_cleaning_snapshot(file_id: str, client_id: str, file_type: str, cleaned_df):
+    """
+    Save the cleaned data exactly as it looked at the moment an Excel export was generated.
+    """
+    import json
+    conn = get_connection()
+    cursor = conn.cursor()
+    snapshot_json = cleaned_df.reset_index().rename(columns={"index": "_row_index"}).to_json(orient="records")
+    cursor.execute("""
+        INSERT INTO cleaning_snapshots (file_id, client_id, file_type, snapshot_data)
+        VALUES (%s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE
+            snapshot_data = VALUES(snapshot_data),
+            created_at = CURRENT_TIMESTAMP
+    """, (file_id, client_id, file_type, snapshot_json))
+    conn.commit()
+    conn.close()
+
+
+def get_cleaning_snapshot(file_id: str, client_id: str, file_type: str):
+    """
+    Retrieve the saved cleaned-data snapshot for comparison against a re-uploaded corrected file.
+    Returns a list of row dicts, or None if no snapshot was ever saved.
+    """
+    import json
+    conn = get_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute("""
+        SELECT snapshot_data FROM cleaning_snapshots
+        WHERE file_id = %s AND client_id = %s AND file_type = %s
+    """, (file_id, client_id, file_type))
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return json.loads(row["snapshot_data"])

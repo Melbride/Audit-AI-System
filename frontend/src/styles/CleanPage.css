@@ -215,3 +215,40 @@
     border-color: var(--accent);
     box-shadow: 0 0 0 3px rgba(52, 152, 219, 0.12);
 }
+
+.issues-summary {
+    background: #FEF9E7;
+    border-left: 4px solid var(--warning);
+    border-radius: 8px;
+    padding: 12px 16px;
+    font-size: 13px;
+    color: var(--text);
+    margin-top: 8px;
+}
+
+.action-buttons {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin-top: 16px;
+}
+
+.btn-proceed {
+    background: var(--success);
+}
+
+.btn-proceed:disabled {
+    background: #ccc;
+    cursor: not-allowed;
+}
+
+.clean-complete {
+    background: #EAFAF1;
+    color: var(--success);
+    padding: 12px 16px;
+    border-radius: 8px;
+    font-weight: 600;
+    font-size: 14px;
+    margin-top: 8px;
+    text-align: center;
+}

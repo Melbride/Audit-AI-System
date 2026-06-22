@@ -3,154 +3,162 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
-# Styles
-HEADER_FILL   = PatternFill(start_color="1E3A5F", end_color="1E3A5F", fill_type="solid")
-HEADER_FONT   = Font(color="FFFFFF", bold=True, name="Arial", size=10)
-FILL_HIGH     = PatternFill(start_color="FFDAD9", end_color="FFDAD9", fill_type="solid")
-FILL_MEDIUM   = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
-FILL_INFO     = PatternFill(start_color="EAF0FB", end_color="EAF0FB", fill_type="solid")
-FILL_CLEAN    = PatternFill(start_color="FFFFFF", end_color="FFFFFF", fill_type="solid")
-NORMAL_FONT   = Font(name="Arial", size=10)
-BOLD_FONT     = Font(bold=True, name="Arial", size=10)
-CENTER_ALIGN  = Alignment(vertical="center", horizontal="center")
-LEFT_ALIGN    = Alignment(vertical="center", horizontal="left")
-WRAP_ALIGN    = Alignment(wrap_text=True, vertical="top", horizontal="left")
-SEV_FILLS  = {"high": FILL_HIGH, "medium": FILL_MEDIUM, "info": FILL_INFO}
-SEV_LABELS = {"high": "HIGH", "medium": "MEDIUM", "info": "INFO"}
-SEV_ORDER  = {"high": 0, "medium": 1, "info": 2}
 
-# Helper to map row index to highest severity issue for that row, used for coloring rows in cleaned data sheet
-def _row_severity_map(issues: list) -> dict:
-    result = {}
+# Fill colors used consistently across the workbook.
+# Only ONE fill color marks "this row has an issue" — no severity-based color variation.
+FLAGGED_ROW_FILL = PatternFill(start_color="FFFFC7CE", end_color="FFFFC7CE", fill_type="solid")  # red highlight
+HEADER_FILL = PatternFill(start_color="FF1E3A5F", end_color="FF1E3A5F", fill_type="solid")
+HEADER_FONT = Font(color="FFFFFFFF", bold=True)
+UNRESOLVED_HEADER_FONT = Font(color="FFFFFFFF", bold=True, italic=True)
+WRAP_ALIGNMENT = Alignment(wrap_text=True, vertical="top")
+TOP_ALIGNMENT = Alignment(vertical="top")
+
+# Name of the hidden column that stores each row's original dataframe index. This lets a
+# later re-uploaded file be matched back to the correct row by stable ID rather than by
+# position, so the auditor can delete or reorder rows in Excel and the system still knows
+# exactly which original row each remaining row corresponds to.
+ROW_ID_COLUMN = "_row_id"
+
+
+def _is_unresolved_column(mapping: dict, original_col: str) -> bool:
+    """
+    A column is unresolved if its mapping entry still says mapped_to == "unknown".
+    These columns were never renamed by clean_dataframe and still sit under their
+    original name in the cleaned data — we mark them visibly so the auditor can
+    finish that mapping decision while looking at the real data in Excel.
+    """
+    info = mapping.get(original_col)
+    return isinstance(info, dict) and info.get("mapped_to") == "unknown"
+
+
+def _group_issues_by_row(issues: list) -> dict:
+    """
+    Group row-level issues by their row_index so we can tell which rows are flagged.
+    Column-level issues (row_index == "N/A") are excluded — they don't belong to a
+    specific row and only appear on the Issues Summary sheet.
+    """
+    grouped = {}
     for issue in issues:
-        ri = issue.get("row_index")
-        if ri in (None, "N/A"):
+        row_index = issue.get("row_index")
+        if row_index == "N/A" or row_index is None:
             continue
-        try:
-            ri = int(ri)
-        except (ValueError, TypeError):
-            continue
-        sev = issue.get("severity", "medium")
-        if ri not in result or SEV_ORDER.get(sev, 1) < SEV_ORDER.get(result[ri], 1):
-            result[ri] = sev
-    return result
+        grouped.setdefault(int(row_index), []).append(issue)
+    return grouped
 
-# Main function to build the Excel workbook with cleaned data and issues report, returns as BytesIO for sending as file response
-def build_cleaning_workbook(cleaned_df, report: dict, mapping: dict) -> BytesIO:
-    issues      = report.get("issues", [])
-    row_sev_map = _row_severity_map(issues)
-    # Exclude internal columns from display
-    columns = [c for c in cleaned_df.columns if c not in ("_is_duplicate",)]
+
+def build_cleaning_workbook(cleaned_df, report: dict, mapping: dict, filename_hint: str = "cleaned_data") -> BytesIO:
+    """
+    Build a two-sheet workbook for the cleaning correction loop:
+      Sheet 1 "Cleaned Data" — the cleaned dataframe exactly as-is. Rows with at least
+        one issue are highlighted in red so they're easy to spot. Columns still mapped
+        to "unknown" get their header marked "[UNRESOLVED] <original name>" so the
+        auditor can finish that mapping decision while looking at real data. No Issues
+        column here — full issue details live on the Issues Summary sheet instead, so
+        this sheet stays focused purely on the data itself.
+        A hidden "_row_id" column stores each row's original dataframe index, so a
+        later re-uploaded file can be matched back to the correct row even if rows
+        were deleted or reordered by the auditor in Excel.
+        The sheet is NOT protected/locked — the auditor can freely edit any cell,
+        including headers, rows, and columns, since audit work requires that flexibility.
+      Sheet 2 "Issues Summary" — a flat checklist of every issue (including
+        column-level issues like unknown columns and sparse-column flags), with the
+        row number so the auditor can cross-reference back to Sheet 1.
+    Returns an in-memory BytesIO of the .xlsx file, ready to stream as a download.
+    """
+    issues = report.get("issues", [])
+    issues_by_row = _group_issues_by_row(issues)
+
     wb = Workbook()
 
-    # SHEET1 is Cleaned Data, Mirrors exactly what the frontend table shows, all rows, highlighted
-    ws = wb.active
-    ws.title = "Cleaned Data"
-    # Header: # column then all data columns
-    ws.cell(1, 1).value     = "#"
-    ws.cell(1, 1).fill      = HEADER_FILL
-    ws.cell(1, 1).font      = HEADER_FONT
-    ws.cell(1, 1).alignment = CENTER_ALIGN
-    # Data columns
-    for col_idx, col_name in enumerate(columns, start=2):
-        cell           = ws.cell(1, col_idx)
-        cell.value     = col_name
-        cell.fill      = HEADER_FILL
-        cell.font      = HEADER_FONT
-        cell.alignment = CENTER_ALIGN
-    ws.row_dimensions[1].height = 20
+    # ---------- Sheet 1: Cleaned Data ----------
+    data_sheet = wb.active
+    data_sheet.title = "Cleaned Data"
 
-    # Data rows
-    for df_index, row in cleaned_df.iterrows():
-        excel_row = int(df_index) + 2
-        sev       = row_sev_map.get(int(df_index))
-        row_fill  = SEV_FILLS.get(sev, FILL_CLEAN)
+    columns = list(cleaned_df.columns)
+    # Drop the internal duplicate-marker column if present — it's not meant for the auditor to see
+    columns = [c for c in columns if c != "_is_duplicate"]
+    # Hidden row-id column goes first, then all data columns. No Issues column —
+    # that detail lives on the Issues Summary sheet only.
+    header_row = [ROW_ID_COLUMN] + columns
 
-        # # column, same number shown on screen
-        nr_cell           = ws.cell(excel_row, 1)
-        # matches what is shown on the CleanPage table (row_index + 2, or N/A)
-        nr_cell.value     = excel_row          
-        nr_cell.fill      = row_fill
-        nr_cell.font      = BOLD_FONT
-        nr_cell.alignment = CENTER_ALIGN
+    # Write header row. Unresolved columns get a visibly different label and font style
+    # so they stand out from columns that are already confirmed.
+    for col_idx, col_name in enumerate(header_row, start=1):
+        cell = data_sheet.cell(row=1, column=col_idx)
+        if col_name != ROW_ID_COLUMN and _is_unresolved_column(mapping, col_name):
+            cell.value = f"[UNRESOLVED] {col_name}"
+            cell.font = UNRESOLVED_HEADER_FONT
+        else:
+            cell.value = col_name
+            cell.font = HEADER_FONT
+        cell.fill = HEADER_FILL
+        cell.alignment = TOP_ALIGNMENT
 
-        # data columns
-        for col_idx, col_name in enumerate(columns, start=2):
-            cell  = ws.cell(excel_row, col_idx)
+    # Write data rows. dataframe index is used directly as the row id, matching the
+    # issue's row_index produced by clean_dataframe since both come from the same dataframe.
+    for row_offset, (df_index, row) in enumerate(cleaned_df.iterrows(), start=2):
+        row_issues = issues_by_row.get(df_index, [])
+        is_flagged = len(row_issues) > 0
+
+        # Hidden row id, written first in every row
+        id_cell = data_sheet.cell(row=row_offset, column=1)
+        id_cell.value = int(df_index)
+        id_cell.alignment = TOP_ALIGNMENT
+        if is_flagged:
+            id_cell.fill = FLAGGED_ROW_FILL
+
+        for col_offset, col_name in enumerate(columns, start=2):
+            cell = data_sheet.cell(row=row_offset, column=col_offset)
             value = row[col_name]
-            # Write blank for None/nan, never inject 0 for missing
-            cell.value     = "" if value is None or str(value).strip().lower() in ("nan", "none", "") else value
-            cell.fill      = row_fill
-            cell.font      = NORMAL_FONT
-            cell.alignment = LEFT_ALIGN
+            cell.value = "" if (value is None or str(value).lower() == "nan") else value
+            cell.alignment = TOP_ALIGNMENT
+            if is_flagged:
+                cell.fill = FLAGGED_ROW_FILL
 
-    # Column widths
-    ws.column_dimensions["A"].width = 6
-    for col_idx, col_name in enumerate(columns, start=2):
-        try:
-            max_len = max(
-                len(str(col_name)),
-                max((len(str(v)) for v in cleaned_df[col_name].head(200)
-                     if v is not None and str(v).lower() not in ("nan", "none", "")), default=0)
-            )
-        except (ValueError, TypeError):
-            max_len = len(str(col_name))
-        ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 4, 40)
-    ws.freeze_panes = "B2"
+    # Column widths — set explicitly based on content so headers and data line up consistently.
+    # The hidden row-id column doesn't need a visible width since it's hidden anyway.
+    data_sheet.column_dimensions[get_column_letter(1)].width = 8
+    data_sheet.column_dimensions[get_column_letter(1)].hidden = True
+    for col_offset, col_name in enumerate(columns, start=2):
+        header_len = len(f"[UNRESOLVED] {col_name}") if _is_unresolved_column(mapping, col_name) else len(col_name)
+        max_data_len = max([len(str(v)) for v in cleaned_df[col_name].head(50)] or [0])
+        width = min(max(header_len, max_data_len) + 4, 40)
+        data_sheet.column_dimensions[get_column_letter(col_offset)].width = width
 
-    # SHEET2 is Issues, Mirrors exactly what the Issues Found section shows on screen
-    iss_ws = wb.create_sheet("Issues")
-    iss_headers = ["Severity", "Row", "Column", "Original Value", "Issue"]
-    for col_idx, h in enumerate(iss_headers, start=1):
-        cell           = iss_ws.cell(1, col_idx)
-        cell.value     = h
-        cell.fill      = HEADER_FILL
-        cell.font      = HEADER_FONT
-        cell.alignment = CENTER_ALIGN
-    iss_ws.row_dimensions[1].height = 20
+    # Freeze the header row so it stays visible while scrolling through data
+    data_sheet.freeze_panes = "A2"
 
-    # Sort: high first, then medium, then info, then by row number
-    def sort_key(iss):
-        sev = SEV_ORDER.get(iss.get("severity", "info"), 2)
-        try:    rn = int(iss.get("row_index", 99999))
-        except: rn = 99999
-        return (sev, rn)
-    # Add issues to sheet, with same coloring and formatting as frontend table, including original value only when present, and wrap text for issue description
-    for issue in sorted(issues, key=sort_key):
-        sev      = issue.get("severity", "medium")
-        ri       = issue.get("row_index", "N/A")
-        col      = issue.get("column", "")
-        orig_val = issue.get("original_value", "")
-        desc     = issue.get("issue", "")
+    # No sheet protection — the auditor needs to freely edit cells, rows, and columns,
+    # including occasionally renaming an [UNRESOLVED] header. Protection caused real
+    # editing problems in Excel and isn't worth the tradeoff for an audit tool where
+    # flexibility matters more than guarding against accidental renames.
 
-        # Display row matches what CleanPage shows: row_index + 2, or N/A for missing-value issues without row index
-        try:    display_row = int(ri) + 2
-        except: display_row = "N/A"
+    # ---------- Sheet 2: Issues Summary ----------
+    summary_sheet = wb.create_sheet("Issues Summary")
+    summary_headers = ["Row", "Column", "Issue", "Severity"]
+    for col_idx, header in enumerate(summary_headers, start=1):
+        cell = summary_sheet.cell(row=1, column=col_idx)
+        cell.value = header
+        cell.font = HEADER_FONT
+        cell.fill = HEADER_FILL
 
-        # Only show original value when there is one, if no original value, hides the "Original value:" line entirely for missing-value issues
-        orig_display = str(orig_val) if orig_val and str(orig_val).strip() not in ("", "N/A") else ""
-        fill = SEV_FILLS.get(sev, FILL_MEDIUM)
-        iss_ws.append([
-            SEV_LABELS.get(sev, sev.upper()),
-            display_row,
-            col,
-            orig_display,
-            desc,
-        ])
-        r = iss_ws.max_row
-        # Apply fill to entire row, bold font for severity and row/column, wrap text for issue description, adjust row height based on description length
-        for c_idx in range(1, 6):
-            cell           = iss_ws.cell(r, c_idx)
-            cell.fill      = fill
-            cell.font      = BOLD_FONT if c_idx in (1, 2) else NORMAL_FONT
-            cell.alignment = WRAP_ALIGN if c_idx == 5 else LEFT_ALIGN
-        iss_ws.row_dimensions[r].height = 40 if len(str(desc)) > 80 else 20
-    for col_idx, width in {1: 12, 2: 8, 3: 26, 4: 22, 5: 70}.items():
-        iss_ws.column_dimensions[get_column_letter(col_idx)].width = width
-    iss_ws.freeze_panes    = "A2"
-    iss_ws.auto_filter.ref = "A1:E1"
-    # Save 
+    for row_offset, issue in enumerate(issues, start=2):
+        summary_sheet.cell(row=row_offset, column=1).value = issue.get("row", "N/A")
+        summary_sheet.cell(row=row_offset, column=2).value = issue.get("column", "")
+        issue_cell = summary_sheet.cell(row=row_offset, column=3)
+        issue_cell.value = issue.get("issue", "")
+        issue_cell.alignment = WRAP_ALIGNMENT
+        summary_sheet.cell(row=row_offset, column=4).value = issue.get("severity", "")
+
+    summary_sheet.column_dimensions["A"].width = 10
+    summary_sheet.column_dimensions["B"].width = 28
+    summary_sheet.column_dimensions["C"].width = 70
+    summary_sheet.column_dimensions["D"].width = 12
+    summary_sheet.freeze_panes = "A2"
+
     buffer = BytesIO()
     wb.save(buffer)
     buffer.seek(0)
     return buffer
+
+    

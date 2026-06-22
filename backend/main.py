@@ -1,7 +1,6 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
-# from fastapi.responses import FileResponse
 from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel
 from typing import Optional, Literal
@@ -19,75 +18,59 @@ import shutil
 import secrets
 import hashlib
 from dotenv import load_dotenv
-from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Protection
-from openpyxl.utils import get_column_letter
 from detector import detect_columns_with_llm, build_detection_result, suggest_file_type
 from database import (
     init_db, get_db, save_mapping, get_mapping, save_upload, get_uploads,
     save_cleaning_acknowledgment, get_acknowledged_issue_ids,
     save_cleaning_corrections, get_cleaning_corrections,
+    save_fingerprint, get_fingerprint,
     save_cleaning_snapshot, get_cleaning_snapshot,
 )
 from cleaner import clean_dataframe
 from excel_export import build_cleaning_workbook
-from openpyxl.styles import Font, PatternFill, Protection, Alignment
-from database import save_fingerprint, get_fingerprint
-from validators.mapping_validator import validate_mapping_no_duplicates
+from excel_diff import diff_uploaded_against_snapshot
 
-
-# Load environment variables from .env file
 load_dotenv()
-# SECRET_KEY = os.getenv("SECRET_KEY")
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BACKEND_DIR = os.path.join(BASE_DIR, "backend")
 if BACKEND_DIR not in sys.path:
     sys.path.append(BACKEND_DIR)
 
-# Initialize FastAPI app
 app = FastAPI(title="AuditAI API Running!", debug=True)
-# Add CORS middleware to allow frontend to communicate with backend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
-# Initialize database tables on startup. Runs once when the app starts
+
 @app.on_event("startup")
 async def startup_event():
     init_db()
 
-# Security config for JWT token generation and password hashing
 SECRET_KEY = os.getenv("SECRET_KEY")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_HOURS = 8
 pwd_context = CryptContext(schemes=["sha256_crypt"], deprecated="auto")
 
-# Create uploads directory if it doesn't exist. Define allowed file extensions
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 ALLOWED_EXTENSIONS = {"csv", "xlsx", "xls", "pdf", "docx"}
 
-# Hash a plain text password before storing it in the database
 def hash_password(password: str):
     return pwd_context.hash(password)
 
-# Verify a plain text password against a stored hashed password
 def verify_password(plain: str, hashed: str):
     return pwd_context.verify(plain, hashed)
 
-# Create a JWT token with an expiry time for a logged in user
 def create_token(data: dict):
     expire = datetime.utcnow() + timedelta(hours=ACCESS_TOKEN_EXPIRE_HOURS)
     data.update({"exp": expire})
     return jwt.encode(data, SECRET_KEY, algorithm=ALGORITHM)
 
-# Get file extension from filename
 def get_extension(filename: str) -> str:
     return filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
 
-# Extract tables and text from PDF files using pdfplumber. Falls back to raw text if no tables found
 def extract_pdf(file_path: str):
     tables = []
     full_text = ""
@@ -108,7 +91,6 @@ def extract_pdf(file_path: str):
         return pd.DataFrame({"raw_text": lines}), "text"
     return None, None
 
-# Extract tables and paragraphs from DOCX files using python-docx. Falls back to paragraphs if no tables found
 def extract_docx(file_path: str):
     doc = Document(file_path)
     tables = []
@@ -126,9 +108,6 @@ def extract_docx(file_path: str):
         return pd.DataFrame({"raw_text": lines}), "text"
     return None, None
 
-# Read any supported uploaded file into a DataFrame based on its extension.
-# Reads everything as string dtype to avoid pandas silently coercing values (e.g. "001" -> 1).
-# Drops fully-empty columns and strips whitespace consistently across upload, detect and clean
 def read_file_to_df(save_path: str, ext: str):
     if ext == "csv":
         df = pd.read_csv(save_path, dtype=str)
@@ -142,15 +121,12 @@ def read_file_to_df(save_path: str, ext: str):
         return df
     else:
         return None
-    # Drop completely empty columns consistently across upload, detect and clean
     if df is not None:
         df = df.dropna(axis=1, how='all')
         df = df.loc[:, ~(df == '').all()]
-        # Strip whitespace and tab characters from all cells
         df = df.map(lambda x: x.strip() if isinstance(x, str) else x)
     return df
 
-# Calculate fill rate per column. Fill rate is the percentage of rows that have a value (0.0 to 1.0)
 def calculate_fill_rates(df: pd.DataFrame) -> dict:
     fill_rates = {}
     total = len(df)
@@ -160,11 +136,6 @@ def calculate_fill_rates(df: pd.DataFrame) -> dict:
     return fill_rates
 
 def compute_schema_fingerprint(columns: list) -> str:
-    """
-    Compute a fingerprint for a file's column structure.
-    Same columns in any order = same fingerprint.
-    Any column added/removed/renamed = different fingerprint.
-    """
     sorted_cols = sorted([col.lower().strip() for col in columns])
     fingerprint = hashlib.md5(json.dumps(sorted_cols).encode()).hexdigest()
     return fingerprint
@@ -227,16 +198,55 @@ def filter_acknowledged_issues(report: dict, file_id: str, client_id: str, file_
     return rebuild_report_counts(report)
 
 def apply_saved_corrections(df: pd.DataFrame, mapping: dict, corrections: list) -> pd.DataFrame:
+    """
+    Apply every saved correction to the source dataframe before cleaning runs.
+    Handles cell-value corrections, row deletions (column_name == "_row_deleted"),
+    and column deletions (column_name starts with "_column_deleted:"). Deletions are
+    applied first so they persist on every future cleaning run, not just one response.
+    """
     if not corrections:
         return df
+
     standard_to_original = {
         info.get("mapped_to"): original_col
         for original_col, info in mapping.items()
         if isinstance(info, dict) and info.get("mapped_to") not in ("", "unknown", None)
     }
+
+    rows_to_drop = []
+    columns_to_drop = []
+    value_corrections = []
+
     for correction in corrections:
+        col = correction.get("column_name", correction.get("column"))
+        if col == "_row_deleted":
+            rows_to_drop.append(int(correction["row_index"]))
+        elif col and str(col).startswith("_column_deleted:"):
+            original_col_name = col.split(":", 1)[1]
+            columns_to_drop.append(original_col_name)
+        else:
+            value_corrections.append(correction)
+
+    if rows_to_drop:
+        df = df.drop(index=[r for r in rows_to_drop if r in df.index])
+    if columns_to_drop:
+        # Translate standard mapped names back to original column names
+        # because df still has original names at this point (before rename_columns runs)
+        resolved_columns_to_drop = []
+        for col_name in columns_to_drop:
+            # Check if it's already an original column name
+            if col_name in df.columns:
+                resolved_columns_to_drop.append(col_name)
+            else:
+                # Look up the original name from the mapping
+                original = standard_to_original.get(col_name)
+                if original and original in df.columns:
+                    resolved_columns_to_drop.append(original)
+        df = df.drop(columns=resolved_columns_to_drop)
+
+    for correction in value_corrections:
         row_index = int(correction["row_index"])
-        issue_col = correction["column_name"]
+        issue_col = correction.get("column_name", correction.get("column"))
         source_col = standard_to_original.get(issue_col, issue_col)
         if source_col in df.columns and row_index in df.index:
             df.at[row_index, source_col] = correction["corrected_value"]
@@ -280,7 +290,6 @@ def run_cleaning_cycle(file_id: str, client_id: str, file_type: str, mapping: di
     report = filter_acknowledged_issues(report, file_id, client_id, file_type)
     return cleaned_df, report
 
-# Models for request validation. Pydantic models define the shape of data coming into each endpoint
 class Client(BaseModel):
     company_name: str
     contact_person: Optional[str] = None
@@ -291,7 +300,6 @@ class Client(BaseModel):
     status: Optional[str] = "Active"
     kra_pin: Literal[True, False] = False
 
-# User model for creating a new user with a password
 class User(BaseModel):
     full_name: str
     email: str
@@ -301,7 +309,6 @@ class User(BaseModel):
     assigned_client_id: Optional[int] = None
     status: Optional[str] = "Active"
 
-# UserUpdate model for updating a user without changing their password
 class UserUpdate(BaseModel):
     full_name: str
     email: str
@@ -310,21 +317,17 @@ class UserUpdate(BaseModel):
     assigned_client_id: Optional[int] = None
     status: Optional[str] = "Active"
 
-# LoginRequest model for email and password login
 class LoginRequest(BaseModel):
     email: str
     password: str
 
-# PasswordResetRequest model for requesting a password reset token via email
 class PasswordResetRequest(BaseModel):
     email: str
 
-# PasswordResetConfirm model for confirming a password reset with a token and new password
 class PasswordResetConfirm(BaseModel):
     token: str
     new_password: str
 
-# ColumnMapping model for manually saving a column mapping for a client
 class ColumnMapping(BaseModel):
     client_id: str
     file_type: Optional[str] = "general"
@@ -332,7 +335,6 @@ class ColumnMapping(BaseModel):
     mapped_to: str
     confirmed_by: Optional[str] = None
 
-# Engagement model for creating and updating audit engagements per client
 class Engagement(BaseModel):
     client_id: int
     engagement_name: str
@@ -341,20 +343,17 @@ class Engagement(BaseModel):
     start_date: Optional[str] = None
     end_date: Optional[str] = None
 
-# EngagementTeam model for adding a user to an engagement team with a role
 class EngagementTeam(BaseModel):
     engagement_id: int
     user_id: int
     role: str
 
-# AuditSection model for creating and updating audit sections within an engagement
 class AuditSection(BaseModel):
     engagement_id: int
     section_name: str
     status: Optional[str] = "Pending"
     assigned_to: Optional[int] = None
 
-# Submission model for creating a submission for an audit section
 class Submission(BaseModel):
     engagement_id: int
     section_id: int
@@ -362,46 +361,38 @@ class Submission(BaseModel):
     status: Optional[str] = "Draft"
     notes: Optional[str] = None
 
-# SubmissionStatus model for updating the status of a submission
 class SubmissionStatus(BaseModel):
     status: Literal["Draft", "Submitted", "Under Review", "Changes Requested", "Approved"]
     notes: Optional[str] = None
 
-# Notification model for sending a notification to a user
 class Notification(BaseModel):
     user_id: int
     message: str
     type: Optional[str] = "engagement_alert"
 
-# LLM DETECTION ROUTES  
-# Root endpoint to confirm the API is running
 @app.get("/")
 def root():
     return {"message": "Audit AI API is running"}
 
-# Upload endpoint for AI pipeline. Accepts a file and client_id, saves the file, reads it into a DataFrame.Calculates fill rates and returns a preview of the data for column detection
 @app.post("/upload")
 async def upload_file_ai(
     file: UploadFile = File(...),
     client_id: str = Form(...)
 ):
-    # Validate file extension against allowed types
     ext = get_extension(file.filename)
     if ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(status_code=415, detail=f"File type .{ext} not supported. Upload Excel, CSV, PDF or DOCX file only.")
-    # Check file size does not exceed 50MB limit
     MAX_FILE_SIZE = 50
     file_bytes = await file.read()
     file_size_mb = len(file_bytes) / (1024 * 1024)
     if file_size_mb > MAX_FILE_SIZE:
         raise HTTPException(status_code=413, detail=f"File size exceeds the maximum limit of {MAX_FILE_SIZE} MB. Uploaded file size: {file_size_mb:.2f} MB.")
-    # Reset file pointer after reading for size check, then save to disk
     file.file.seek(0)
     file_id = str(uuid.uuid4())
     save_path = os.path.join(UPLOAD_DIR, f"{file_id}.{ext}")
     with open(save_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
-    # Handle PDF files, extract tables or text and return fill rates and preview
+
     if ext == "pdf":
         df, source = extract_pdf(save_path)
         if df is None:
@@ -411,7 +402,7 @@ async def upload_file_ai(
         return {"file_id": file_id, "client_id": client_id, "filename": file.filename, "source": source,
                 "rows": len(df), "columns": list(df.columns), "fill_rates": fill_rates,
                 "preview": df.head(5).fillna("").to_dict(orient="records"), "message": f"PDF uploaded — extracted via {source}"}
-    # Handle DOCX files, extract tables or paragraphs and return fill rates and preview
+
     if ext == "docx":
         df, source = extract_docx(save_path)
         if df is None:
@@ -421,39 +412,21 @@ async def upload_file_ai(
         return {"file_id": file_id, "client_id": client_id, "filename": file.filename, "source": source,
                 "rows": len(df), "columns": list(df.columns), "fill_rates": fill_rates,
                 "preview": df.head(5).fillna("").to_dict(orient="records"), "message": f"DOCX uploaded — extracted via {source}"}
-    # Handle CSV and Excel files, read into DataFrame and return fill rates and preview
+
     try:
         df = pd.read_csv(save_path, dtype=str) if ext == "csv" else pd.read_excel(save_path, dtype=str)
-        # Strip whitespace from all cells
         df = df.map(lambda x: x.strip() if isinstance(x, str) else x)
-        # Drop completely empty columns
         df = df.dropna(axis=1, how='all')
         df = df.loc[:, ~(df == '').all()]
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not read file: {str(e)}")
     save_upload(file_id, client_id, file.filename, ext, len(df))
     fill_rates = calculate_fill_rates(df)
-    # Compute schema fingerprint for this file structure
-    # fingerprint = compute_schema_fingerprint(list(df.columns))
-    # Save fingerprint to database
-    # save_fingerprint(client_id, fingerprint, ext, list(df.columns))
     return {"file_id": file_id, "client_id": client_id, "filename": file.filename, "source": "table",
             "rows": len(df), "columns": list(df.columns), "fill_rates": fill_rates,
-            "fingerprint": compute_schema_fingerprint(list(df.columns)), "preview": df.head(5).fillna("").to_dict(orient="records"), "message": "File uploaded and processed successfully"}
+            "fingerprint": compute_schema_fingerprint(list(df.columns)),
+            "preview": df.head(5).fillna("").to_dict(orient="records"), "message": "File uploaded and processed successfully"}
 
-
-# Detect column meanings using LLM. First checks if client has a saved mapping, if yes, skips LLM entirely.If no saved mapping is found, reads the file, extracts sample values and runs LLM detection.
-# Also suggests a file_type category based on the columns, so the auditor can confirm/correct it on the mapping page
-# instead of every upload being saved under the same hardcoded "general" bucket.
-#
-# IMPORTANT: the saved-mapping lookup uses the freshly-suggested file_type, not the incoming
-# file_type form parameter. The frontend cannot know the correct file_type before this call
-# returns a suggestion (file_type is only known AFTER the AI looks at the columns), so trusting
-# the incoming parameter for the lookup would almost always miss a real saved mapping and
-# re-run the LLM unnecessarily on every upload, even repeat uploads of the same file type.
-#
-# This is also the correct place to save the schema fingerprint — /upload only knows the
-# file extension at save time, not the real file_type category, which is only computed here.
 @app.post("/detect-columns")
 async def detect_columns_endpoint(
     client_id: str = Form(...),
@@ -463,20 +436,16 @@ async def detect_columns_endpoint(
     fill_rates: str = Form("{}"),
     fingerprint: str = Form("")
 ):
-
-    # Parse columns list from JSON string sent by frontend
     try:
         columns_list = json.loads(columns)
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Invalid columns format.")
 
-    # Parse fill rates from JSON string sent by frontend
     try:
         fill_rates_dict = json.loads(fill_rates)
     except json.JSONDecodeError:
         fill_rates_dict = {}
 
-    # Find the uploaded file on disk
     save_path = None
     file_ext = None
     for extension in ALLOWED_EXTENSIONS:
@@ -488,7 +457,6 @@ async def detect_columns_endpoint(
     if not save_path:
         raise HTTPException(status_code=404, detail="File not found. Please upload the file first.")
 
-    # Read file and extract first non-empty sample value per column
     try:
         df = read_file_to_df(save_path, file_ext)
         if df is None:
@@ -503,51 +471,26 @@ async def detect_columns_endpoint(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not read file: {str(e)}")
 
-    # Suggest a file_type category based on columns and sample values.
-    # This MUST run before the saved-mapping lookup below, since the lookup needs this value.
     try:
         file_type_suggestion = suggest_file_type(columns_list, sample_values)
     except Exception:
         file_type_suggestion = {"file_type": "other", "file_type_label": "Other"}
 
-    # Use the freshly suggested file_type for the saved-mapping lookup, not the raw incoming
-    # file_type parameter. On a client's first ever upload the frontend has no real file_type
-    # yet (it only learns one from this response), and on later uploads the frontend's stored
-    # file_type can be stale from a previous session — the suggestion computed just above is
-    # always derived fresh from this file's actual columns, so it's the reliable lookup key.
     effective_file_type = file_type_suggestion["file_type"]
 
-    # Compute the schema fingerprint once, here, now that the real file_type is known.
     computed_fingerprint = compute_schema_fingerprint(columns_list)
-
-    # Save the fingerprint using the real file_type category, not a file extension placeholder.
-    # /upload cannot do this correctly since it runs before file_type is ever determined.
     save_fingerprint(client_id, computed_fingerprint, effective_file_type, columns_list)
 
-    print("🔥 DETECT-COLUMNS HIT")
-    print("CLIENT ID:", client_id)
-    print("COLUMNS:", columns_list)
-    print("EFFECTIVE FILE TYPE FOR LOOKUP:", effective_file_type)
-
-    # Check fingerprint cache and saved mapping, both keyed on the effective (suggested) file_type
     saved_mapping = get_mapping(client_id, effective_file_type)
     existing_fp = get_fingerprint(client_id, computed_fingerprint, effective_file_type)
 
-    # =========================
-    # 1. CACHE PATH
-    # =========================
     if existing_fp and saved_mapping:
         filtered_mapping = {
             col: saved_mapping.get(col)
             for col in columns_list
             if col in saved_mapping
         }
-        result = build_detection_result(
-            columns_list,
-            filtered_mapping,
-            sample_values,
-            fill_rates_dict
-        )
+        result = build_detection_result(columns_list, filtered_mapping, sample_values, fill_rates_dict)
         result["file_id"] = file_id
         result["source"] = "fingerprint_cache"
         result["message"] = "Mapping reused from cache."
@@ -555,9 +498,6 @@ async def detect_columns_endpoint(
         result["suggested_file_type_label"] = file_type_suggestion["file_type_label"]
         return result
 
-    # Also check the saved mapping directly (covers the case where the fingerprint wasn't
-    # recorded yet but a mapping already exists for this client + suggested file_type, e.g.
-    # the very first detect call right after upload before any fingerprint write happened)
     if saved_mapping:
         all_mapped = all(col in saved_mapping for col in columns_list)
         if all_mapped:
@@ -570,30 +510,13 @@ async def detect_columns_endpoint(
             result["suggested_file_type_label"] = file_type_suggestion["file_type_label"]
             return result
 
-    # =========================
-    # 2. LLM PATH
-    # =========================
     try:
-        mapping = detect_columns_with_llm(
-            columns_list,
-            sample_values,
-            fill_rates_dict
-        )
-
+        mapping = detect_columns_with_llm(columns_list, sample_values, fill_rates_dict)
         if not mapping:
             raise HTTPException(status_code=500, detail="LLM returned empty mapping.")
 
-        # Build result first
-        result = build_detection_result(
-            columns_list,
-            mapping,
-            sample_values,
-            fill_rates_dict
-        )
+        result = build_detection_result(columns_list, mapping, sample_values, fill_rates_dict)
 
-        # De-duplicate mappings gracefully — if two original columns map to the same
-        # standard name, keep the first one and demote the rest to "unknown" with a
-        # suggestion. This prevents a 422 crash and lets the auditor fix it in the UI.
         dedup_warnings = []
         seen_targets = set()
         for original_col, info in list(result["mapping"].items()):
@@ -618,7 +541,6 @@ async def detect_columns_endpoint(
             else:
                 seen_targets.add(target)
 
-        # Recalculate unknown count and warnings after de-duplication
         unknown_columns = [
             col for col, info in result["mapping"].items()
             if info.get("mapped_to") == "unknown" or info.get("field_type") == "unknown"
@@ -648,9 +570,8 @@ async def detect_columns_endpoint(
     result["source"] = "llm_detection"
     result["suggested_file_type"] = file_type_suggestion["file_type"]
     result["suggested_file_type_label"] = file_type_suggestion["file_type_label"]
-
     return result
-# Save a confirmed column mapping for a client so future uploads skip LLM detection
+
 @app.post("/save-mapping")
 async def save_mapping_endpoint(
     client_id: str = Form(...),
@@ -658,7 +579,6 @@ async def save_mapping_endpoint(
     mapping: str = Form(...),
     confirmed_by: str = Form(None)
 ):
-    # Parse mapping dict from JSON string sent by frontend
     try:
         mapping_dict = json.loads(mapping)
     except json.JSONDecodeError:
@@ -669,7 +589,6 @@ async def save_mapping_endpoint(
     return {"client_id": client_id, "file_type": file_type, "columns_saved": len(mapping_dict),
             "message": f"Mapping saved successfully for client {client_id} and file type {file_type}."}
 
-# Retrieve a previously saved column mapping for a client and file type
 @app.get("/get-mapping/{client_id}")
 async def get_mapping_endpoint(client_id: str, file_type: str = "general"):
     mapping = get_mapping(client_id, file_type)
@@ -679,20 +598,17 @@ async def get_mapping_endpoint(client_id: str, file_type: str = "general"):
     return {"client_id": client_id, "file_type": file_type, "mapping": mapping,
             "columns_mapped": len(mapping), "message": "Saved mapping retrieved successfully."}
 
-# Get upload history for a client ordered by most recent first
 @app.get("/uploads/{client_id}")
 async def get_uploads_endpoint(client_id: str):
     uploads = get_uploads(client_id)
     return {"client_id": client_id, "total_uploads": len(uploads), "uploads": uploads}
 
-# Clean the uploaded file using the confirmed mapping. Requires a saved mapping to exist for the client
 @app.post("/clean")
 async def clean_file(
     file_id: str = Form(...),
     client_id: str = Form(...),
     file_type: str = Form("general")
 ) -> dict:
-    # Check that a confirmed mapping exists before attempting to clean
     mapping = get_mapping(client_id, file_type)
     if not mapping:
         raise HTTPException(status_code=400, detail="No saved mapping found for this client. Please detect the columns and confirm the mapping first.")
@@ -705,59 +621,166 @@ async def clean_file(
 
 @app.get("/clean/export-cleaned/{file_id}")
 async def export_cleaned_workbook(file_id: str, client_id: str, file_type: str = "general"):
-
     mapping = get_mapping(client_id, file_type)
     if not mapping:
-        raise HTTPException(status_code=400, detail="No saved mapping found")
-
+        raise HTTPException(status_code=400, detail="No saved mapping found for this client. Please detect the columns and confirm the mapping first.")
     cleaned_df, report = run_cleaning_cycle(file_id, client_id, file_type, mapping)
     save_cleaning_snapshot(file_id, client_id, file_type, cleaned_df)
     workbook_buffer = build_cleaning_workbook(cleaned_df, report, mapping)
-
-    #confirm it's a real Excel file
-    content = workbook_buffer.getvalue()
-    print("FILE SIZE:", len(content))
-
-    from fastapi.responses import Response
-
-    return Response(
-        content=workbook_buffer.getvalue(),
+    download_filename = f"{file_id}_cleaned_data.xlsx"
+    return StreamingResponse(
+        workbook_buffer,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename={file_id}.xlsx'}
+        headers={"Content-Disposition": f'attachment; filename="{download_filename}"'}
     )
 
-# @app.post("/reupload-corrections")
-# async def reupload_corrected_file(
-#     file: UploadFile = File(...),
-#     file_id: str = Form(...),
-#     client_id: str = Form(...),
-#     file_type: str = Form("general")
-# ):
-#     df = pd.read_excel(file.file, dtype=str)
-#     df = df.map(lambda x: x.strip() if isinstance(x, str) else x)
+@app.post("/clean/submit-corrected-excel")
+async def submit_corrected_excel(
+    file: UploadFile = File(...),
+    file_id: str = Form(...),
+    client_id: str = Form(...),
+    file_type: str = Form("general"),
+    corrected_by: str = Form(None),
+):
+    mapping = get_mapping(client_id, file_type)
+    if not mapping:
+        raise HTTPException(status_code=400, detail="No saved mapping found for this client. Please detect the columns and confirm the mapping first.")
 
-#     # Load mapping again
-#     mapping = get_mapping(client_id, file_type)
-#     if not mapping:
-#         raise HTTPException(status_code=400, detail="No mapping found")
-    
-#     # Run cleaning again to reuse the existing pipeline
-#     fill_rates = calculate_fill_rates(df)
-#     cleaned_df, report = clean_dataframe(df, mapping, fill_rates)
+    snapshot_rows = get_cleaning_snapshot(file_id, client_id, file_type)
+    if not snapshot_rows:
+        raise HTTPException(
+            status_code=400,
+            detail="No downloaded snapshot found for this file. Please download the cleaned Excel first, edit it, then upload it back."
+        )
 
+    temp_path = os.path.join(UPLOAD_DIR, f"corrected_{uuid.uuid4()}.xlsx")
+    with open(temp_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
 
-# MANAGEMENT ROUTES  
-# Create a router for all management routes. This router is registered into the main app at the bottom
+    try:
+        diff_result = diff_uploaded_against_snapshot(temp_path, snapshot_rows)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        # Clean up the temp file, but never let a cleanup failure crash the request.
+        # On Windows, openpyxl can briefly hold a file handle even after close() in some
+        # edge cases (antivirus scanning, OS-level delays) — a delete failure here should
+        # not lose the auditor's corrections, which by this point may already be processed.
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except (PermissionError, OSError):
+            pass
+
+    corrections = diff_result["corrections"]
+    deleted_row_ids = diff_result["deleted_row_ids"]
+    deleted_columns = diff_result["deleted_columns"]
+
+    if not corrections and not deleted_row_ids and not deleted_columns:
+        raise HTTPException(
+            status_code=400,
+            detail="No changes were detected in the uploaded file compared to what was downloaded."
+        )
+
+    if corrections:
+        save_cleaning_corrections(file_id, client_id, file_type, corrections, corrected_by)
+
+    if deleted_row_ids:
+        deletion_records = [
+            {"row_index": row_id, "column": "_row_deleted",
+             "original_value": "present", "corrected_value": "deleted_by_auditor"}
+            for row_id in deleted_row_ids
+        ]
+        save_cleaning_corrections(file_id, client_id, file_type, deletion_records, corrected_by)
+
+    if deleted_columns:
+        column_deletion_records = [
+            {"row_index": -1, "column": f"_column_deleted:{col}",
+             "original_value": "present", "corrected_value": "deleted_by_auditor"}
+            for col in deleted_columns
+        ]
+        save_cleaning_corrections(file_id, client_id, file_type, column_deletion_records, corrected_by)
+
+    cleaned_df, report = run_cleaning_cycle(file_id, client_id, file_type, mapping)
+
+    return {
+        "file_id": file_id,
+        "client_id": client_id,
+        "file_type": file_type,
+        "cleaned_data": cleaned_df.fillna("").astype(str).map(lambda x: x.strip()).to_dict(orient="records"),
+        "validation_report": report,
+        "can_proceed": report.get("total_issues", 0) == 0,
+        "corrections_applied": len(corrections),
+        "rows_deleted": deleted_row_ids,
+        "columns_deleted": deleted_columns,
+        "message": (
+            f"{len(corrections)} correction(s), {len(deleted_row_ids)} row deletion(s), "
+            f"and {len(deleted_columns)} column deletion(s) applied from the uploaded file. "
+            f"File re-cleaned successfully."
+        )
+    }
+
+@app.post("/clean/acknowledge-issue")
+async def acknowledge_issue_endpoint(
+    file_id: str = Form(...),
+    client_id: str = Form(...),
+    file_type: str = Form("general"),
+    issue: str = Form(...),
+    acknowledged_by: str = Form(None),
+):
+    mapping = get_mapping(client_id, file_type)
+    if not mapping:
+        raise HTTPException(status_code=400, detail="No saved mapping found for this client.")
+    try:
+        issue_dict = json.loads(issue)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid issue format.")
+    issue_id = issue_dict.get("issue_id") or issue_fingerprint(file_id, client_id, file_type, issue_dict)
+    save_cleaning_acknowledgment(issue_id, file_id, client_id, file_type, issue_dict, acknowledged_by)
+    cleaned_df, report = run_cleaning_cycle(file_id, client_id, file_type, mapping)
+    return {
+        "file_id": file_id, "client_id": client_id, "file_type": file_type,
+        "cleaned_data": cleaned_df.fillna("").astype(str).map(lambda x: x.strip()).to_dict(orient="records"),
+        "validation_report": report,
+        "can_proceed": report.get("total_issues", 0) == 0,
+        "message": "Issue acknowledged."
+    }
+
+@app.post("/clean/submit-inline-corrections")
+async def submit_inline_corrections_endpoint(
+    file_id: str = Form(...),
+    client_id: str = Form(...),
+    file_type: str = Form("general"),
+    corrections: str = Form(...),
+    corrected_by: str = Form(None),
+):
+    mapping = get_mapping(client_id, file_type)
+    if not mapping:
+        raise HTTPException(status_code=400, detail="No saved mapping found for this client.")
+    try:
+        corrections_list = json.loads(corrections)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid corrections format.")
+    if not corrections_list:
+        raise HTTPException(status_code=400, detail="No corrections provided.")
+    save_cleaning_corrections(file_id, client_id, file_type, corrections_list, corrected_by)
+    cleaned_df, report = run_cleaning_cycle(file_id, client_id, file_type, mapping)
+    return {
+        "file_id": file_id, "client_id": client_id, "file_type": file_type,
+        "cleaned_data": cleaned_df.fillna("").astype(str).map(lambda x: x.strip()).to_dict(orient="records"),
+        "validation_report": report,
+        "can_proceed": report.get("total_issues", 0) == 0,
+        "message": f"{len(corrections_list)} correction(s) saved and re-cleaned."
+    }
+
 audit_router = APIRouter()
 
-# CLIENTS.Get all clients from the database
 @audit_router.get("/clients")
 def get_clients(db=Depends(get_db)):
     cursor = db.cursor(dictionary=True)
     cursor.execute("SELECT * FROM clients")
     return cursor.fetchall()
 
-# Get a single client by client_id. Returns 404 if not found
 @audit_router.get("/clients/{client_id}")
 def get_client(client_id: int, db=Depends(get_db)):
     cursor = db.cursor(dictionary=True)
@@ -767,7 +790,6 @@ def get_client(client_id: int, db=Depends(get_db)):
         raise HTTPException(status_code=404, detail="Client not found")
     return client
 
-# Create a new client and return the new client_id
 @audit_router.post("/clients")
 def create_client(c: Client, db=Depends(get_db)):
     cursor = db.cursor()
@@ -779,7 +801,6 @@ def create_client(c: Client, db=Depends(get_db)):
     db.commit()
     return {"client_id": cursor.lastrowid, "message": "Client created"}
 
-# Update an existing client by client_id
 @audit_router.put("/clients/{client_id}")
 def update_client(client_id: int, c: Client, db=Depends(get_db)):
     cursor = db.cursor()
@@ -791,7 +812,6 @@ def update_client(client_id: int, c: Client, db=Depends(get_db)):
     db.commit()
     return {"message": "Client updated"}
 
-# Delete a client by client_id
 @audit_router.delete("/clients/{client_id}")
 def delete_client(client_id: int, db=Depends(get_db)):
     cursor = db.cursor()
@@ -799,7 +819,6 @@ def delete_client(client_id: int, db=Depends(get_db)):
     db.commit()
     return {"message": "Client deleted"}
 
-# USERS.Get all users joined with their assigned client company name
 @audit_router.get("/users")
 def get_users(db=Depends(get_db)):
     cursor = db.cursor(dictionary=True)
@@ -811,7 +830,6 @@ def get_users(db=Depends(get_db)):
     """)
     return cursor.fetchall()
 
-# Get a single user by user_id. Password hash is removed before returning
 @audit_router.get("/users/{user_id}")
 def get_user(user_id: int, db=Depends(get_db)):
     cursor = db.cursor(dictionary=True)
@@ -822,7 +840,6 @@ def get_user(user_id: int, db=Depends(get_db)):
     user.pop("password_hash", None)
     return user
 
-# Create a new user. Password is hashed before storing. Returns 400 if email already exists
 @audit_router.post("/users")
 def create_user(u: User, db=Depends(get_db)):
     hashed = hash_password(u.password)
@@ -838,7 +855,6 @@ def create_user(u: User, db=Depends(get_db)):
     except Exception:
         raise HTTPException(status_code=400, detail="Email already exists")
 
-# Update an existing user by user_id. Does not change password
 @audit_router.put("/users/{user_id}")
 def update_user(user_id: int, u: UserUpdate, db=Depends(get_db)):
     cursor = db.cursor()
@@ -850,7 +866,6 @@ def update_user(user_id: int, u: UserUpdate, db=Depends(get_db)):
     db.commit()
     return {"message": "User updated"}
 
-# Delete a user by user_id
 @audit_router.delete("/users/{user_id}")
 def delete_user(user_id: int, db=Depends(get_db)):
     cursor = db.cursor()
@@ -858,7 +873,6 @@ def delete_user(user_id: int, db=Depends(get_db)):
     db.commit()
     return {"message": "User deleted"}
 
-# Assign a user to a specific client by updating their assigned_client_id
 @audit_router.put("/users/{user_id}/assign/{client_id}")
 def assign_user_to_client(user_id: int, client_id: int, db=Depends(get_db)):
     cursor = db.cursor()
@@ -866,17 +880,13 @@ def assign_user_to_client(user_id: int, client_id: int, db=Depends(get_db)):
     db.commit()
     return {"message": "User assigned to client"}
 
-# AUTH
-# Login endpoint. Verifies email and password then returns a JWT token and user info
 @audit_router.post("/auth/login")
 def login(req: LoginRequest, db=Depends(get_db)):
     cursor = db.cursor(dictionary=True)
     cursor.execute("SELECT * FROM users WHERE email = %s", (req.email,))
     user = cursor.fetchone()
-    # Return 401 if user not found or password is wrong
     if not user or not verify_password(req.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid email or password")
-    # Return 403 if user account is not active
     if user["status"] != "Active":
         raise HTTPException(status_code=403, detail="Account is inactive")
     token = create_token({"user_id": user["user_id"], "email": user["email"], "role": user["role"]})
@@ -884,7 +894,6 @@ def login(req: LoginRequest, db=Depends(get_db)):
             "user": {"user_id": user["user_id"], "full_name": user["full_name"],
                      "email": user["email"], "role": user["role"]}}
 
-# Request a password reset token. Generates a secure token and stores it in the database
 @audit_router.post("/auth/password-reset-request")
 def password_reset_request(req: PasswordResetRequest, db=Depends(get_db)):
     cursor = db.cursor(dictionary=True)
@@ -900,13 +909,11 @@ def password_reset_request(req: PasswordResetRequest, db=Depends(get_db)):
     db.commit()
     return {"message": "Password reset token generated", "token": token}
 
-# Confirm a password reset. Validates the token, updates the password and deletes the used token
 @audit_router.post("/auth/password-reset-confirm")
 def password_reset_confirm(req: PasswordResetConfirm, db=Depends(get_db)):
     cursor = db.cursor(dictionary=True)
     cursor.execute("SELECT * FROM password_resets WHERE token = %s AND expires_at > NOW()", (req.token,))
     reset = cursor.fetchone()
-    # Return 400 if token is invalid or has expired
     if not reset:
         raise HTTPException(status_code=400, detail="Invalid or expired reset token")
     hashed = hash_password(req.new_password)
@@ -916,23 +923,12 @@ def password_reset_confirm(req: PasswordResetConfirm, db=Depends(get_db)):
     db.commit()
     return {"message": "Password reset successful"}
 
-# User management column mappings 
-
-# Get all column mappings across all clients
-# @audit_router.get("/column-mappings")
-# def get_all_mappings(db=Depends(get_db)):
-#     cursor = db.cursor(dictionary=True)
-#     cursor.execute("SELECT * FROM column_mappings")
-#     return cursor.fetchall()
-
-# Get all column mappings for a specific client
 @audit_router.get("/column-mappings/{client_id}")
 def get_client_mappings(client_id: str, db=Depends(get_db)):
     cursor = db.cursor(dictionary=True)
     cursor.execute("SELECT * FROM column_mappings WHERE client_id = %s", (client_id,))
     return cursor.fetchall()
 
-# Update an existing column mapping by mapping_id
 @audit_router.put("/column-mappings/{mapping_id}")
 def update_mapping(mapping_id: int, m: ColumnMapping, db=Depends(get_db)):
     cursor = db.cursor()
@@ -944,7 +940,6 @@ def update_mapping(mapping_id: int, m: ColumnMapping, db=Depends(get_db)):
     db.commit()
     return {"message": "Column mapping updated"}
 
-# Delete a column mapping by mapping_id
 @audit_router.delete("/column-mappings/{mapping_id}")
 def delete_mapping(mapping_id: int, db=Depends(get_db)):
     cursor = db.cursor()
@@ -952,8 +947,6 @@ def delete_mapping(mapping_id: int, db=Depends(get_db)):
     db.commit()
     return {"message": "Column mapping deleted"}
 
-# ENGAGEMENTS 
-# Get all engagements joined with their client company name, ordered by most recent first
 @audit_router.get("/engagements")
 def get_engagements(db=Depends(get_db)):
     cursor = db.cursor(dictionary=True)
@@ -964,7 +957,6 @@ def get_engagements(db=Depends(get_db)):
     """)
     return cursor.fetchall()
 
-# Get a single engagement by engagement_id. Returns 404 if not found
 @audit_router.get("/engagements/{engagement_id}")
 def get_engagement(engagement_id: int, db=Depends(get_db)):
     cursor = db.cursor(dictionary=True)
@@ -978,7 +970,6 @@ def get_engagement(engagement_id: int, db=Depends(get_db)):
         raise HTTPException(status_code=404, detail="Engagement not found")
     return engagement
 
-# Create a new engagement and auto-generate default audit sections: Revenue, Expenses, Inventory, Cash & Bank
 @audit_router.post("/engagements")
 def create_engagement(e: Engagement, db=Depends(get_db)):
     cursor = db.cursor()
@@ -993,7 +984,6 @@ def create_engagement(e: Engagement, db=Depends(get_db)):
     db.commit()
     return {"engagement_id": engagement_id, "message": "Engagement created with default audit sections"}
 
-# Update an existing engagement by engagement_id
 @audit_router.put("/engagements/{engagement_id}")
 def update_engagement(engagement_id: int, e: Engagement, db=Depends(get_db)):
     cursor = db.cursor()
@@ -1005,7 +995,6 @@ def update_engagement(engagement_id: int, e: Engagement, db=Depends(get_db)):
     db.commit()
     return {"message": "Engagement updated"}
 
-# Delete an engagement and all its related sections and team members
 @audit_router.delete("/engagements/{engagement_id}")
 def delete_engagement(engagement_id: int, db=Depends(get_db)):
     cursor = db.cursor()
@@ -1015,8 +1004,6 @@ def delete_engagement(engagement_id: int, db=Depends(get_db)):
     db.commit()
     return {"message": "Engagement deleted"}
 
-# ENGAGEMENT TEAM
-# Get all team members for an engagement joined with their user details
 @audit_router.get("/engagements/{engagement_id}/team")
 def get_engagement_team(engagement_id: int, db=Depends(get_db)):
     cursor = db.cursor(dictionary=True)
@@ -1027,7 +1014,6 @@ def get_engagement_team(engagement_id: int, db=Depends(get_db)):
     """, (engagement_id,))
     return cursor.fetchall()
 
-# Add a user to an engagement team with a specific role
 @audit_router.post("/engagements/{engagement_id}/team")
 def add_team_member(engagement_id: int, t: EngagementTeam, db=Depends(get_db)):
     cursor = db.cursor()
@@ -1036,7 +1022,6 @@ def add_team_member(engagement_id: int, t: EngagementTeam, db=Depends(get_db)):
     db.commit()
     return {"team_id": cursor.lastrowid, "message": "Team member added"}
 
-# Remove a user from an engagement team by engagement_id and user_id
 @audit_router.delete("/engagements/{engagement_id}/team/{user_id}")
 def remove_team_member(engagement_id: int, user_id: int, db=Depends(get_db)):
     cursor = db.cursor()
@@ -1044,8 +1029,6 @@ def remove_team_member(engagement_id: int, user_id: int, db=Depends(get_db)):
     db.commit()
     return {"message": "Team member removed"}
 
-# AUDIT SECTIONS ROUTES
-# Get all audit sections for an engagement joined with the assigned user's name
 @audit_router.get("/engagements/{engagement_id}/sections")
 def get_audit_sections(engagement_id: int, db=Depends(get_db)):
     cursor = db.cursor(dictionary=True)
@@ -1056,7 +1039,6 @@ def get_audit_sections(engagement_id: int, db=Depends(get_db)):
     """, (engagement_id,))
     return cursor.fetchall()
 
-# Add a new audit section to an engagement
 @audit_router.post("/engagements/{engagement_id}/sections")
 def add_audit_section(engagement_id: int, s: AuditSection, db=Depends(get_db)):
     cursor = db.cursor()
@@ -1065,7 +1047,6 @@ def add_audit_section(engagement_id: int, s: AuditSection, db=Depends(get_db)):
     db.commit()
     return {"section_id": cursor.lastrowid, "message": "Audit section added"}
 
-# Update an existing audit section by section_id
 @audit_router.put("/audit-sections/{section_id}")
 def update_audit_section(section_id: int, s: AuditSection, db=Depends(get_db)):
     cursor = db.cursor()
@@ -1074,7 +1055,6 @@ def update_audit_section(section_id: int, s: AuditSection, db=Depends(get_db)):
     db.commit()
     return {"message": "Audit section updated"}
 
-# Delete an audit section by section_id
 @audit_router.delete("/audit-sections/{section_id}")
 def delete_audit_section(section_id: int, db=Depends(get_db)):
     cursor = db.cursor()
@@ -1082,8 +1062,6 @@ def delete_audit_section(section_id: int, db=Depends(get_db)):
     db.commit()
     return {"message": "Audit section deleted"}
 
-# SUBMISSIONS 
-# Get all submissions joined with user, engagement and section details, ordered by most recent first
 @audit_router.get("/submissions")
 def get_all_submissions(db=Depends(get_db)):
     cursor = db.cursor(dictionary=True)
@@ -1097,7 +1075,6 @@ def get_all_submissions(db=Depends(get_db)):
     """)
     return cursor.fetchall()
 
-# Get a single submission by submission_id. Returns 404 if not found
 @audit_router.get("/submissions/{submission_id}")
 def get_submission(submission_id: int, db=Depends(get_db)):
     cursor = db.cursor(dictionary=True)
@@ -1114,7 +1091,6 @@ def get_submission(submission_id: int, db=Depends(get_db)):
         raise HTTPException(status_code=404, detail="Submission not found")
     return submission
 
-# Create a new submission. If status is Submitted, auto-notify Senior Auditors and Auditors on the engagement team
 @audit_router.post("/submissions")
 def create_submission(s: Submission, db=Depends(get_db)):
     cursor = db.cursor()
@@ -1124,7 +1100,6 @@ def create_submission(s: Submission, db=Depends(get_db)):
         (s.engagement_id, s.section_id, s.submitted_by, s.status, s.notes)
     )
     submission_id = cursor.lastrowid
-    # If submission is marked as Submitted, send notifications to auditors on the team
     if s.status == "Submitted":
         cursor.execute("""
             SELECT e.engagement_name, sec.section_name FROM engagements e
@@ -1145,7 +1120,6 @@ def create_submission(s: Submission, db=Depends(get_db)):
     db.commit()
     return {"submission_id": submission_id, "message": "Submission created"}
 
-# Update the status of a submission by submission_id
 @audit_router.put("/submissions/{submission_id}/status")
 def update_submission_status(submission_id: int, s: SubmissionStatus, db=Depends(get_db)):
     cursor = db.cursor()
@@ -1154,7 +1128,6 @@ def update_submission_status(submission_id: int, s: SubmissionStatus, db=Depends
     db.commit()
     return {"message": f"Submission status updated to {s.status}"}
 
-# Delete a submission by submission_id
 @audit_router.delete("/submissions/{submission_id}")
 def delete_submission(submission_id: int, db=Depends(get_db)):
     cursor = db.cursor()
@@ -1162,22 +1135,18 @@ def delete_submission(submission_id: int, db=Depends(get_db)):
     db.commit()
     return {"message": "Submission deleted"}
 
-# NOTIFICATIONS 
-# Get all notifications for a user ordered by most recent first
 @audit_router.get("/notifications/{user_id}")
 def get_user_notifications(user_id: int, db=Depends(get_db)):
     cursor = db.cursor(dictionary=True)
     cursor.execute("SELECT * FROM notifications WHERE user_id = %s ORDER BY created_at DESC", (user_id,))
     return cursor.fetchall()
 
-# Get only unread notifications for a user ordered by most recent first
 @audit_router.get("/notifications/{user_id}/unread")
 def get_unread_notifications(user_id: int, db=Depends(get_db)):
     cursor = db.cursor(dictionary=True)
     cursor.execute("SELECT * FROM notifications WHERE user_id = %s AND is_read = FALSE ORDER BY created_at DESC", (user_id,))
     return cursor.fetchall()
 
-# Mark a single notification as read by notification_id
 @audit_router.put("/notifications/{notification_id}/read")
 def mark_notification_read(notification_id: int, db=Depends(get_db)):
     cursor = db.cursor()
@@ -1185,7 +1154,6 @@ def mark_notification_read(notification_id: int, db=Depends(get_db)):
     db.commit()
     return {"message": "Notification marked as read"}
 
-# Mark all notifications for a user as read
 @audit_router.put("/notifications/{user_id}/read-all")
 def mark_all_read(user_id: int, db=Depends(get_db)):
     cursor = db.cursor()
@@ -1193,31 +1161,6 @@ def mark_all_read(user_id: int, db=Depends(get_db)):
     db.commit()
     return {"message": "All notifications marked as read"}
 
-# # CLIENT FILE UPLOAD 
-# # Upload a file for a specific client. Saves the file to disk and records it in the uploads table for audit trail.
-# @audit_router.post("/clients/{client_id}/upload")
-# def upload_client_file(client_id: int, file: UploadFile = File(...), db=Depends(get_db)):
-#     allowed_types = ["xlsx", "xls", "csv", "pdf", "tiff", "tif", "jpg", "jpeg", "png", "xml", "json", "txt"]
-#     file_ext = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else ""
-#     if file_ext not in allowed_types:
-#         raise HTTPException(status_code=400, detail="File format not allowed. Accepted: Excel (.xlsx, .xls), CSV (.csv), PDF (.pdf), Scanned (.jpg, .png, .tiff), ERP (.xml, .json, .txt)")
-#     file_path = f"{UPLOAD_DIR}/{client_id}_{file.filename}"
-#     with open(file_path, "wb") as buffer:
-#         shutil.copyfileobj(file.file, buffer)
-#     cursor = db.cursor()
-#     cursor.execute("INSERT INTO uploads (client_id, file_name, file_type, file_path) VALUES (%s, %s, %s, %s)",
-#                    (client_id, file.filename, file_ext.upper(), file_path))
-#     db.commit()
-#     return {"file_id": cursor.lastrowid, "filename": file.filename, "type": file_ext.upper(), "message": "File uploaded successfully"}
-
-# Get all files uploaded for a specific client
-# @audit_router.get("/clients/{client_id}/files")
-# def get_client_files(client_id: str, db=Depends(get_db)):
-#     cursor = db.cursor(dictionary=True)
-#     cursor.execute("SELECT * FROM uploads WHERE client_id = %s", (client_id,))
-#     return cursor.fetchall()
-
-# Get all uploaded files across all clients joined with company name. For admin use only — should be protected in production
 @audit_router.get("/files")
 def get_all_files(db=Depends(get_db)):
     cursor = db.cursor(dictionary=True)
@@ -1228,13 +1171,8 @@ def get_all_files(db=Depends(get_db)):
     """)
     return cursor.fetchall()
 
-# REGISTER AUDIT ROUTER INTO MAIN APP.Plug all management routes into the main app. All audit_router routes are available on the same server
 app.include_router(audit_router)
 
-# Entry point when running the file directly.
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
-
-
-    

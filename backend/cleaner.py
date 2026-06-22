@@ -488,3 +488,6 @@ def build_validation_report(df: pd.DataFrame, original_df: pd.DataFrame, issues:
         "info_issues": len(info_issues),
         "issues": issues
     }
+
+
+    

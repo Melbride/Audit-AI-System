@@ -1,9 +1,10 @@
-import { useState } from 'react'
+import { useState, useRef } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import {
     acknowledgeIssue,
     cleanFile,
     submitInlineCorrections,
+    submitCorrectedExcel,
 } from '../services/api'
 import '../styles/UploadPage.css'
 import '../styles/CleanPage.css'
@@ -25,6 +26,10 @@ function CleanPage() {
     const [error, setError] = useState(null)
     const [pendingEdits, setPendingEdits] = useState({})
     const [submitting, setSubmitting] = useState(false)
+    // Tracks whether the corrected Excel file is currently being uploaded and processed
+    const [uploadingCorrected, setUploadingCorrected] = useState(false)
+    // Ref to the hidden file input used for picking the corrected Excel file
+    const correctedFileInputRef = useRef(null)
 
     const issueCount = cleanResult?.validation_report?.issues?.length || 0
     const useInlineCorrections = issueCount > 0 && issueCount <= INLINE_LIMIT
@@ -58,7 +63,8 @@ function CleanPage() {
         }
     }
 
-    // Refresh clean result and current upload info after acknowledging or correcting an issue
+    // Refresh clean result and current upload info after acknowledging, correcting,
+    // or uploading a corrected Excel file
     const refreshFromResponse = (data) => {
         setCleanResult(data)
         setPendingEdits({})
@@ -91,11 +97,48 @@ function CleanPage() {
         }
     }
 
-    // Download, hits the real Excel endpoint which returns a presigned URL for the cleaned file in S3
+    // Download, hits the real Excel endpoint which returns the cleaned workbook with
+    // highlighted issues and a hidden row-tracking column for the upload-back flow
     const handleDownloadExcel = () => {
         if (!cleanResult) return
         const url = `${API_BASE}/clean/export-cleaned/${cleanResult.file_id}?client_id=${encodeURIComponent(clientId)}&file_type=${encodeURIComponent(fileType || 'other')}`
         window.open(url, '_blank')
+    }
+
+    // Triggered when the auditor picks a file via the hidden file input. Sends the edited
+    // Excel file back to the backend, which compares it against the snapshot saved at
+    // download time, applies any cell corrections / row deletions / column deletions found,
+    // and returns a freshly re-cleaned result — handled the same way as acknowledge/inline-correct.
+    const handleUploadCorrectedFile = async (e) => {
+        const selectedFile = e.target.files[0]
+        if (!selectedFile) return
+        if (!cleanResult) return
+
+        setUploadingCorrected(true)
+        setError(null)
+        try {
+            const formData = new FormData()
+            formData.append('file', selectedFile)
+            formData.append('file_id', cleanResult.file_id)
+            formData.append('client_id', clientId)
+            formData.append('file_type', fileType || 'other')
+            formData.append('corrected_by', 'Auditor')
+
+            const response = await submitCorrectedExcel(formData)
+            console.log("CORRECTED EXCEL RESPONSE:", response.data)
+            refreshFromResponse(response.data)
+        } catch (err) {
+            setError(
+                err.response?.data?.detail ||
+                'Could not process the corrected file. Please make sure you uploaded the file exactly as it was downloaded.'
+            )
+        } finally {
+            setUploadingCorrected(false)
+            // Reset the file input so the same file can be re-selected later if needed
+            if (correctedFileInputRef.current) {
+                correctedFileInputRef.current.value = ''
+            }
+        }
     }
 
     // Determine if an issue is eligible for inline correction, must have specific row/column and not be a "missing value" issue without an original value
@@ -285,6 +328,17 @@ function CleanPage() {
                                         {submitting ? 'Re-cleaning...' : 'Save Corrections & Re-clean'}
                                     </button>
                                 )}
+
+                                {/* When there are too many issues for inline editing, point the auditor
+                                    toward the download + edit + upload-back workflow instead */}
+                                {!useInlineCorrections && (
+                                    <p className="mapping-note">
+                                        There are {issueCount} issues — too many to edit inline. Download the
+                                        full workbook below, fix the issues in Excel (you may also delete rows
+                                        or columns you judge unnecessary), then upload the corrected file back
+                                        using "Upload Corrected File".
+                                    </p>
+                                )}
                             </div>
                         )}
 
@@ -337,6 +391,23 @@ function CleanPage() {
                         >
                             Download Full Workbook (.xlsx)
                         </button>
+
+                        {/* Upload the corrected Excel file back. Hidden file input triggered by
+                            the visible button so it looks consistent with the rest of the UI. */}
+                        <button
+                            className="btn btn-inline"
+                            onClick={() => correctedFileInputRef.current?.click()}
+                            disabled={uploadingCorrected}
+                        >
+                            {uploadingCorrected ? 'Processing...' : 'Upload Corrected File'}
+                        </button>
+                        <input
+                            type="file"
+                            accept=".xlsx"
+                            ref={correctedFileInputRef}
+                            style={{ display: 'none' }}
+                            onChange={handleUploadCorrectedFile}
+                        />
 
                         {/* Proceed to analysis */}
                         <button

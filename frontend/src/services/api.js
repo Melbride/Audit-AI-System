@@ -38,23 +38,26 @@ export const cleanFile = (formData) =>
         headers: { 'Content-Type': 'multipart/form-data' }
     })
 
+// Acknowledge a flagged issue as correct as-is.
+// Path corrected to match main.py's actual route: /clean/acknowledge-issue
 export const acknowledgeIssue = (formData) =>
-    API.post('/clean/acknowledge', formData, {
+    API.post('/clean/acknowledge-issue', formData, {
         headers: { 'Content-Type': 'multipart/form-data' }
     })
 
+// Submit inline corrections made directly on the cleaning results screen.
+// Path corrected to match main.py's actual route: /clean/submit-inline-corrections
 export const submitInlineCorrections = (formData) =>
-    API.post('/clean/inline-corrections', formData, {
+    API.post('/clean/submit-inline-corrections', formData, {
         headers: { 'Content-Type': 'multipart/form-data' }
     })
 
-export const submitCorrectedFile = (formData) =>
-    API.post('/clean/submit-corrected-file', formData, {
+// Upload a corrected Excel file (downloaded, edited, and re-uploaded by the auditor).
+// Path corrected to match main.py's actual route: /clean/submit-corrected-excel
+export const submitCorrectedExcel = (formData) =>
+    API.post('/clean/submit-corrected-excel', formData, {
         headers: { 'Content-Type': 'multipart/form-data' }
     })
-
-export const correctionExportUrl = (fileId, clientId, fileType = 'general') =>
-    `${API.defaults.baseURL}/clean/export-corrections/${fileId}?client_id=${encodeURIComponent(clientId)}&file_type=${encodeURIComponent(fileType)}`
 
 // Get upload history for a client
 export const getUploads = (clientId) =>

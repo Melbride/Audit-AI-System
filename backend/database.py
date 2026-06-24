@@ -1,4 +1,5 @@
 import os
+import json
 import mysql.connector
 from dotenv import load_dotenv
 import os
@@ -30,11 +31,9 @@ def get_db():
 # Initialize all database tables on startup. Safe to call repeatedly — uses CREATE TABLE IF NOT EXISTS so existing tables are never recreated or overwritten
 def init_db():
     conn = get_connection()
-    # Use dictionary=True so fetchone() returns dict instead of tuple — needed for the ALTER TABLE column checks below
     cursor = conn.cursor(dictionary=True)
 
     # Column mappings table. Stores confirmed AI or manual mapping per client per file type.
-    # UNIQUE KEY prevents duplicate mappings for the same client + file_type + column combination
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS column_mappings (
             id              INT AUTO_INCREMENT PRIMARY KEY,
@@ -43,13 +42,22 @@ def init_db():
             original_column VARCHAR(255) NOT NULL,
             mapped_to       VARCHAR(255) NOT NULL,
             field_type      VARCHAR(100) NOT NULL DEFAULT 'unknown',
+            reviewed_unknown TINYINT(1) NOT NULL DEFAULT 0,
+            required        TINYINT(1) NOT NULL DEFAULT 1,
             confirmed_by    VARCHAR(255),
             created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
             UNIQUE KEY uq_column_mapping (client_id, file_type, original_column)
         )
     """)
-    # Clients table. Stores company information for each audit client
+    cursor.execute("SELECT COUNT(*) AS count FROM information_schema.columns WHERE table_schema = %s AND table_name = 'column_mappings' AND column_name = 'reviewed_unknown'", (DB_CONFIG["database"],))
+    if cursor.fetchone()["count"] == 0:
+        cursor.execute("ALTER TABLE column_mappings ADD COLUMN reviewed_unknown TINYINT(1) NOT NULL DEFAULT 0")
+    cursor.execute("SELECT COUNT(*) AS count FROM information_schema.columns WHERE table_schema = %s AND table_name = 'column_mappings' AND column_name = 'required'", (DB_CONFIG["database"],))
+    if cursor.fetchone()["count"] == 0:
+        cursor.execute("ALTER TABLE column_mappings ADD COLUMN required TINYINT(1) NOT NULL DEFAULT 1")
+
+    # Clients table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS clients (
             client_id INT AUTO_INCREMENT PRIMARY KEY,
@@ -64,7 +72,23 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # Users table. Stores system users including auditors, accountants and admins.Email must be unique. Password is stored as a hash, never plain text
+
+    # Schema fingerprints table. file_type now stores the REAL file_type category
+    # (e.g. "accounts_payable"), not a file extension — saved from /detect-columns,
+    # which is the only place the real category is known.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS schema_fingerprints (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            client_id VARCHAR(255) NOT NULL,
+            fingerprint VARCHAR(255) NOT NULL,
+            file_type VARCHAR(100) NOT NULL DEFAULT 'general',
+            columns_snapshot TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE KEY uq_fingerprint (client_id, fingerprint, file_type)
+        )
+    """)
+
+    # Users table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INT AUTO_INCREMENT PRIMARY KEY,
@@ -79,7 +103,7 @@ def init_db():
         )
     """)
 
-    # Password resets table. Stores temporary tokens for password reset requests.Token must be unique. Expires after 1 hour
+    # Password resets table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS password_resets (
             reset_id INT AUTO_INCREMENT PRIMARY KEY,
@@ -89,7 +113,8 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # Engagements table. Represents an audit engagement for a client for a specific financial year
+
+    # Engagements table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS engagements (
             engagement_id INT AUTO_INCREMENT PRIMARY KEY,
@@ -103,7 +128,7 @@ def init_db():
         )
     """)
 
-    # Audit sections table. Each engagement has multiple sections like Revenue, Expenses, Inventory.Sections can be assigned to a specific user and tracked by status
+    # Audit sections table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS audit_sections (
             section_id INT AUTO_INCREMENT PRIMARY KEY,
@@ -114,7 +139,8 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # Engagement team table. Links users to engagements with a role. UNIQUE KEY prevents the same user being added to the same engagement twice
+
+    # Engagement team table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS engagement_team (
             team_id INT AUTO_INCREMENT PRIMARY KEY,
@@ -125,7 +151,8 @@ def init_db():
             UNIQUE KEY uq_engagement_team (engagement_id, user_id)
         )
     """)
-    # Submissions table. Tracks work submitted by auditors for review within an engagement section
+
+    # Submissions table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS submissions (
             submission_id INT AUTO_INCREMENT PRIMARY KEY,
@@ -137,7 +164,8 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # Notifications table. Stores in-app alerts sent to users when submissions are ready for review
+
+    # Notifications table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS notifications (
             notification_id INT AUTO_INCREMENT PRIMARY KEY,
@@ -148,8 +176,8 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # Uploads table. Tracks every file uploaded per client for audit trail. File_id is a UUID generated at upload time and must be unique.
-    # `rows` is wrapped in backticks because it is a reserved word in MySQL
+
+    # Uploads table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS uploads (
             id          INT AUTO_INCREMENT PRIMARY KEY,
@@ -165,80 +193,167 @@ def init_db():
             upload_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # Safety checks, add columns to uploads table if they were missing from an older version of the schema
     cursor.execute("SELECT COUNT(*) AS count FROM information_schema.columns WHERE table_schema = %s AND table_name = 'uploads' AND column_name = 'file_name'", (DB_CONFIG["database"],))
     if cursor.fetchone()["count"] == 0:
         cursor.execute("ALTER TABLE uploads ADD COLUMN file_name VARCHAR(255) NULL")
     cursor.execute("SELECT COUNT(*) AS count FROM information_schema.columns WHERE table_schema = %s AND table_name = 'uploads' AND column_name = 'file_path'", (DB_CONFIG["database"],))
     if cursor.fetchone()["count"] == 0:
         cursor.execute("ALTER TABLE uploads ADD COLUMN file_path VARCHAR(500) NULL")
-    # The upload_date column was added later to track the original upload timestamp separately from upload_time which gets updated on status changes.
-    # This check ensures it gets added to existing tables without affecting new ones.
     cursor.execute("SELECT COUNT(*) AS count FROM information_schema.columns WHERE table_schema = %s AND table_name = 'uploads' AND column_name = 'upload_date'", (DB_CONFIG["database"],))
     if cursor.fetchone()["count"] == 0:
         cursor.execute("ALTER TABLE uploads ADD COLUMN upload_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
 
+    # Auditor acknowledgments for issues that are valid as-is
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS cleaning_acknowledgments (
+            id              INT AUTO_INCREMENT PRIMARY KEY,
+            issue_id        VARCHAR(64) NOT NULL UNIQUE,
+            file_id         VARCHAR(255) NOT NULL,
+            client_id       VARCHAR(255) NOT NULL,
+            file_type       VARCHAR(100) NOT NULL,
+            row_index       VARCHAR(50),
+            excel_row       VARCHAR(50),
+            column_name     VARCHAR(255),
+            original_value  TEXT,
+            issue_message   TEXT,
+            acknowledged_by VARCHAR(255),
+            created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # Inline corrections (also used for row/column deletion markers from the Excel re-upload flow)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS cleaning_corrections (
+            id             INT AUTO_INCREMENT PRIMARY KEY,
+            file_id        VARCHAR(255) NOT NULL,
+            client_id      VARCHAR(255) NOT NULL,
+            file_type      VARCHAR(100) NOT NULL,
+            row_index      INT NOT NULL,
+            column_name    VARCHAR(255) NOT NULL,
+            original_value TEXT,
+            corrected_value TEXT,
+            corrected_by   VARCHAR(255),
+            created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            UNIQUE KEY uq_cleaning_correction (file_id(64), client_id(64), file_type(64), row_index, column_name(191))
+        )
+    """)
+
+    # Cleaning snapshots table. Stores the cleaned data exactly as it looked when the
+    # Excel was downloaded, so a later re-uploaded corrected file can be compared
+    # against the exact data the auditor started editing from.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS cleaning_snapshots (
+            file_id       VARCHAR(255) NOT NULL,
+            client_id     VARCHAR(255) NOT NULL,
+            file_type     VARCHAR(100) NOT NULL,
+            snapshot_data LONGTEXT NOT NULL,
+            created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (file_id, client_id, file_type)
+        )
+    """)
+
     conn.commit()
     conn.close()
 
+
 # Save a confirmed column mapping for a client to the database.
-# Mapping is a dict of { "original_column": { "mapped_to": "amount", "field_type": "numeric" } }
-# If a mapping already exists for this client + file_type + column it will be updated not duplicated
 def save_mapping(client_id: str, file_type: str, mapping: dict, confirmed_by: str = None):
     conn = get_connection()
     cursor = conn.cursor()
+    cursor.execute(
+        "DELETE FROM column_mappings WHERE client_id = %s AND file_type = %s",
+        (client_id, file_type)
+    )
     for original_column, info in mapping.items():
-        # Handle both old format (string) and new format (dict) to ensure backwards compatibility
         if isinstance(info, dict):
             mapped_to  = str(info.get("mapped_to", "unknown"))
             field_type = str(info.get("field_type", "unknown"))
+            reviewed_unknown = 1 if info.get("reviewed_unknown") else 0
+            required = 1 if info.get("required", True) else 0
         else:
             mapped_to  = str(info)
             field_type = "unknown"
-        # Insert new mapping or update existing one if the column already exists for this client and file type
+            reviewed_unknown = 0
+            required = 1
         cursor.execute("""
             INSERT INTO column_mappings
-                (client_id, file_type, original_column, mapped_to, field_type, confirmed_by, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                (client_id, file_type, original_column, mapped_to, field_type, reviewed_unknown, required, confirmed_by, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
             ON DUPLICATE KEY UPDATE
-                mapped_to    = VALUES(mapped_to),
-                field_type   = VALUES(field_type),
-                confirmed_by = VALUES(confirmed_by),
-                updated_at   = CURRENT_TIMESTAMP
-        """, (client_id, file_type, original_column, mapped_to, field_type, confirmed_by))
+                mapped_to        = VALUES(mapped_to),
+                field_type       = VALUES(field_type),
+                reviewed_unknown = VALUES(reviewed_unknown),
+                required         = VALUES(required),
+                confirmed_by     = VALUES(confirmed_by),
+                updated_at       = CURRENT_TIMESTAMP
+        """, (client_id, file_type, original_column, mapped_to, field_type, reviewed_unknown, required, confirmed_by))
     conn.commit()
     conn.close()
 
-# Retrieve the saved column mapping for a client and file type from the database.Returns a dict of { "original_column": { "mapped_to": "amount", "field_type": "numeric" } }
-# Returns empty dict if no mapping has been saved for this client yet
+
+# Save a schema fingerprint, keyed by client + fingerprint + REAL file_type category.
+def save_fingerprint(client_id: str, fingerprint: str, file_type: str, columns: list):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO schema_fingerprints
+            (client_id, fingerprint, file_type, columns_snapshot)
+        VALUES (%s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE id = id
+    """, (
+        client_id,
+        fingerprint,
+        file_type,
+        json.dumps(columns)
+    ))
+    conn.commit()
+    conn.close()
+
+
+def get_fingerprint(client_id: str, fingerprint: str, file_type: str = "general") -> bool:
+    """
+    Check if a schema fingerprint already exists for a client AND file type.
+    Filtering by file_type prevents two different file types that happen to share
+    the same column-name structure from incorrectly matching each other's cache entry.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id FROM schema_fingerprints
+        WHERE client_id = %s AND fingerprint = %s AND file_type = %s
+    """, (client_id, fingerprint, file_type))
+    result = cursor.fetchone()
+    conn.close()
+    return result is not None
+
+
 def get_mapping(client_id: str, file_type: str = "general") -> dict:
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)
-    # Fetch all saved mappings for this client and file type
     cursor.execute("""
-        SELECT original_column, mapped_to, field_type
+        SELECT original_column, mapped_to, field_type, reviewed_unknown, required
         FROM column_mappings
         WHERE client_id = %s AND file_type = %s
     """, (client_id, file_type))
     rows = cursor.fetchall()
     conn.close()
-    # Return empty dict if no mappings found
     if not rows:
         return {}
-    # Convert rows into a nested dict keyed by original column name
     return {
         row["original_column"]: {
-            "mapped_to":  row["mapped_to"],
-            "field_type": row["field_type"]
+            "mapped_to":       row["mapped_to"],
+            "field_type":      row["field_type"],
+            "reviewed_unknown": bool(row.get("reviewed_unknown", 0)),
+            "required":        bool(row.get("required", 1))
         }
         for row in rows
     }
 
-# Save an upload record to the database after a file is successfully uploaded.ON DUPLICATE KEY UPDATE prevents duplicate records if the same file_id is uploaded twice
+
 def save_upload(file_id: str, client_id: str, filename: str, file_type: str, rows: int):
     conn = get_connection()
     cursor = conn.cursor()
-    # `rows` is wrapped in backticks because it is a reserved word in MySQL
     cursor.execute(
         "INSERT INTO uploads (file_id, client_id, filename, file_type,  row_count) VALUES (%s, %s, %s, %s, %s) ON DUPLICATE KEY UPDATE file_id = file_id",
         (file_id, client_id, filename, file_type, rows)
@@ -246,7 +361,7 @@ def save_upload(file_id: str, client_id: str, filename: str, file_type: str, row
     conn.commit()
     conn.close()
 
-# Get all upload records for a client ordered by most recent first.Returns an empty list if the client has no uploads yet
+
 def get_uploads(client_id: str) -> list:
     conn = get_connection()
     cursor = conn.cursor(dictionary=True)

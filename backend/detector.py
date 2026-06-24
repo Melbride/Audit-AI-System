@@ -8,6 +8,20 @@ load_dotenv()
 # Initialize Groq client
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
+# Fixed list of recurring report categories. Kept as a controlled list rather than freeform AI
+# output so the same client's file_type stays stable across uploads and saved mappings don't collide.
+# "other" is the deliberate escape hatch for files that don't match a known category.
+FILE_TYPE_CATEGORIES = {
+    "fixed_assets": "Fixed Assets Register",
+    "bank_transactions": "Bank Transactions",
+    "payroll": "Payroll",
+    "general_ledger": "General Ledger",
+    "accounts_receivable": "Accounts Receivable",
+    "accounts_payable": "Accounts Payable",
+    "inventory": "Inventory",
+    "other": "Other",
+}
+
 # Main function to detect columns using LLM
 def detect_columns_with_llm(columns: list, sample_values: dict = None, fill_rates: dict = None) -> dict:
     """
@@ -64,6 +78,7 @@ Instructions:
 - Stay strictly within financial and accounting context
 - Use your financial knowledge to map every column confidently
 - Only use "unknown" as a last resort for truly meaningless columns
+- For columns mapped to "unknown", still provide a best-guess "suggestion" in lowercase snake_case — what this column might be based on the sample value and column name. This helps the auditor know what to type if they want to fix it manually.
 - Return ONLY a valid JSON object — no text before or after
 
 Example output format:
@@ -71,7 +86,7 @@ Example output format:
   "date": {{"mapped_to": "date", "field_type": "date"}},
   "amt": {{"mapped_to": "amount", "field_type": "numeric"}},
   "vendor name": {{"mapped_to": "vendor", "field_type": "text"}},
-  "unnamed: 15": {{"mapped_to": "unknown", "field_type": "unknown"}}
+  "unnamed: 15": {{"mapped_to": "unknown", "field_type": "unknown", "suggestion": "payment_status"}}
 }}"""
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
@@ -103,19 +118,24 @@ Example output format:
     final_mapping = {}
     for lower_col, original_col in lower_to_original.items():
         result = lowercase_mapping.get(lower_col, {})
-        # Extract mapped_to and field_type
+        # Extract mapped_to, field_type and suggestion
         mapped_to = result.get("mapped_to", "unknown")
         field_type = result.get("field_type", "unknown")
-        # Make sure both are strings
+        suggestion = result.get("suggestion", "")
+        # Make sure all are strings
         if not isinstance(mapped_to, str):
             mapped_to = "unknown"
         if not isinstance(field_type, str):
             field_type = "unknown"
+        if not isinstance(suggestion, str):
+            suggestion = ""
         # Validate field_type is one of the 4 allowed values
         if field_type not in ["numeric", "date", "text", "unknown"]:
             field_type = "unknown"
 
-        # Extra safety, if fill_rate is below 0.20 force unknown.This catches cases where LLM ignores the fill_rate instruction
+        # Extra safety, if fill_rate is below 0.20 force unknown.This catches cases where LLM ignores the fill_rate instruction.
+        # suggestion is kept even when forcing unknown, since it's still useful context for the auditor to see
+        # what the LLM guessed before the fill_rate override kicked in
         col_fill_rate = lowercase_fill_rates.get(lower_col, 1.0)
         if col_fill_rate < 0.20:
             mapped_to = "unknown"
@@ -123,18 +143,100 @@ Example output format:
 
         final_mapping[original_col] = {
             "mapped_to": mapped_to,
-            "field_type": field_type
+            "field_type": field_type,
+            "suggestion": suggestion
         }
     return final_mapping
 
+# Suggest which recurring report category a file belongs to, based on its column names and sample values.
+# Returns one of the keys in FILE_TYPE_CATEGORIES, defaulting to "other" if nothing matches confidently.
+# This is a classification task (pick from a fixed list) rather than open-ended generation, so the LLM
+# is constrained to the same categories every time, keeping a client's saved mappings stable across uploads.
+def suggest_file_type(columns: list, sample_values: dict = None) -> dict:
+    """
+    Send column names and sample values to the LLM and ask it to classify the file
+    into one of the fixed FILE_TYPE_CATEGORIES. Returns a dict with the suggested
+    category key and a plain-language label for display on the frontend.
+    """
+    sample_values = sample_values or {}
+    # Build a compact context of column names with their sample value for classification
+    columns_context = json.dumps([
+        {"column": col, "sample": str(sample_values.get(col, ""))}
+        for col in columns
+    ])
+    # Build the list of allowed categories for the prompt so the LLM can only pick from these
+    allowed_keys = list(FILE_TYPE_CATEGORIES.keys())
+
+    prompt = f"""You are a financial data expert helping an audit firm classify an uploaded file.
+
+Based on the column names and sample values below, classify this file into exactly
+ONE of these categories: {allowed_keys}
+
+Column names and sample values:
+{columns_context}
+
+Instructions:
+- Pick the single best matching category from the list above
+- Use "other" only if the columns genuinely do not match any of the other categories
+- Return ONLY a valid JSON object in this exact format, no text before or after:
+{{"file_type": "fixed_assets"}}"""
+
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a financial data classification assistant for an audit firm. You only return valid JSON. No explanations. No markdown. No backticks."
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        temperature=0,
+        max_tokens=100,
+    )
+    raw = response.choices[0].message.content.strip()
+    raw = raw.replace("```json", "").replace("```", "").strip()
+    try:
+        result = json.loads(raw)
+        file_type = result.get("file_type", "other")
+    except json.JSONDecodeError:
+        file_type = "other"
+
+    # Validate the returned value is actually one of the allowed categories.
+    # Guards against the LLM inventing a new key outside the fixed list
+    if file_type not in FILE_TYPE_CATEGORIES:
+        file_type = "other"
+
+    return {
+        "file_type": file_type,
+        "file_type_label": FILE_TYPE_CATEGORIES[file_type]
+    }
+
 # Build a comprehensive result including warnings for unknown columns
-def build_detection_result(columns: list, final_mapping: dict) -> dict:
+def build_detection_result(columns: list, final_mapping: dict, sample_values: dict = None, fill_rates: dict = None) -> dict:
     """
     Build the full detection result with warnings.
     A column is unknown if either mapped_to or field_type is unknown.
+    sample_values and fill_rates are attached to each column's entry so the frontend
+    has enough context per row for the auditor to review unknown or low-confidence columns
+    without needing a separate API call.
     """
+    # Attach sample_value and fill_rate to every column's mapping entry.
+    # Defaults to empty string / 1.0 if not provided so existing calls without these args still work
+    sample_values = sample_values or {}
+    fill_rates = fill_rates or {}
+    enriched_mapping = {}
+    for col, info in final_mapping.items():
+        enriched_mapping[col] = {
+            **info,
+            "sample_value": sample_values.get(col, ""),
+            "fill_rate": fill_rates.get(col, 1.0)
+        }
+
     unknown_columns = [
-        col for col, info in final_mapping.items()
+        col for col, info in enriched_mapping.items()
         if info.get("mapped_to") == "unknown" or info.get("field_type") == "unknown"
     ]
     warnings = []
@@ -147,7 +249,7 @@ def build_detection_result(columns: list, final_mapping: dict) -> dict:
         # Show warning for each unknown column
     return {
         "total_columns": len(columns),
-        "mapping": final_mapping,
+        "mapping": enriched_mapping,
         "unknown_count": len(unknown_columns),
         "warnings": warnings,
         "requires_manual_mapping": len(unknown_columns) > 0

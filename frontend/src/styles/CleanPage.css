@@ -1,0 +1,254 @@
+/* CleanPage Styles */
+
+.stats-grid {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 12px;
+    margin-bottom: 24px;
+}
+
+.stat-card {
+    background: var(--background);
+    border-radius: 10px;
+    padding: 16px 12px;
+    text-align: center;
+    border: 1px solid #E5E8EC;
+}
+
+.stat-clean {
+    border-top: 3px solid var(--success);
+}
+
+.stat-flagged {
+    border-top: 3px solid var(--warning);
+}
+
+.stat-high {
+    border-top: 3px solid var(--danger);
+}
+
+.stat-medium {
+    border-top: 3px solid var(--warning);
+}
+
+.stat-value {
+    font-size: 28px;
+    font-weight: 700;
+    color: var(--primary);
+}
+
+.stat-label {
+    font-size: 11px;
+    color: #888;
+    font-weight: 600;
+    text-transform: uppercase;
+    margin-top: 4px;
+}
+
+.issues-title {
+    color: var(--primary);
+    font-size: 15px;
+    font-weight: 600;
+    margin-bottom: 12px;
+    margin-top: 8px;
+}
+
+.issues-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-height: 400px;
+    overflow-y: auto;
+}
+
+.issue-row {
+    padding: 10px 14px;
+    border-radius: 8px;
+    border-left: 4px solid;
+}
+
+.issue-high {
+    background: #FDEDEC;
+    border-color: var(--danger);
+}
+
+.issue-medium {
+    background: #FEF9E7;
+    border-color: var(--warning);
+}
+
+.issue-info {
+    background: #EBF5FB;
+    border-color: var(--accent);
+}
+
+.issue-meta {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 4px;
+}
+
+.issue-badge {
+    font-size: 10px;
+    font-weight: 700;
+    padding: 2px 8px;
+    border-radius: 20px;
+    background: rgba(0,0,0,0.08);
+}
+
+.issue-location {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text);
+}
+
+.issue-message {
+    font-size: 12px;
+    color: var(--text);
+}
+
+.issue-value {
+    font-size: 11px;
+    color: #888;
+    margin-top: 2px;
+}
+
+.all-clean {
+    background: #EAFAF1;
+    color: var(--success);
+    padding: 14px 16px;
+    border-radius: 8px;
+    font-weight: 600;
+    font-size: 14px;
+}
+
+.row-flagged {
+    background: #FDEDEC !important;
+}
+
+.mapping-note {
+    color: #888;
+    font-size: 13px;
+    margin-bottom: 16px;
+}
+
+.decision-banner {
+    background: #F4F7FB;
+    border: 1px solid #DDE7F2;
+    color: var(--text);
+    border-radius: 8px;
+    padding: 12px 14px;
+    font-size: 13px;
+    margin-bottom: 16px;
+}
+
+.excel-actions {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+    background: #FBFCFD;
+    border: 1px solid #E5E8EC;
+    border-radius: 8px;
+    padding: 14px;
+    margin-bottom: 18px;
+}
+
+.btn-inline {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 170px;
+    margin: 0;
+    text-decoration: none;
+}
+
+.file-picker {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    color: var(--primary);
+    font-size: 13px;
+    font-weight: 700;
+}
+
+.file-picker input {
+    max-width: 240px;
+}
+
+.issue-actions {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-top: 8px;
+}
+
+.small-btn {
+    border: 1px solid var(--primary);
+    background: var(--white);
+    color: var(--primary);
+    border-radius: 8px;
+    padding: 7px 10px;
+    font-size: 12px;
+    font-weight: 700;
+    cursor: pointer;
+}
+
+.small-btn:disabled {
+    opacity: 0.65;
+    cursor: not-allowed;
+}
+
+.correction-input {
+    min-width: 220px;
+    max-width: 100%;
+    padding: 8px 10px;
+    border: 1px solid #D5D8DC;
+    border-radius: 8px;
+    font-size: 13px;
+    outline: none;
+}
+
+.correction-input:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(52, 152, 219, 0.12);
+}
+
+.issues-summary {
+    background: #FEF9E7;
+    border-left: 4px solid var(--warning);
+    border-radius: 8px;
+    padding: 12px 16px;
+    font-size: 13px;
+    color: var(--text);
+    margin-top: 8px;
+}
+
+.action-buttons {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin-top: 16px;
+}
+
+.btn-proceed {
+    background: var(--success);
+}
+
+.btn-proceed:disabled {
+    background: #ccc;
+    cursor: not-allowed;
+}
+
+.clean-complete {
+    background: #EAFAF1;
+    color: var(--success);
+    padding: 12px 16px;
+    border-radius: 8px;
+    font-weight: 600;
+    font-size: 14px;
+    margin-top: 8px;
+    text-align: center;
+}
